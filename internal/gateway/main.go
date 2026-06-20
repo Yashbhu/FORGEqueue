@@ -59,7 +59,16 @@ func (s *server) EnqueueTask(
 func Start() {
 	//Initialize your custom Redis connection pool pointer
 	redisAddress := "localhost:6379"
-	taskRouter := NewTaskRouter(redisAddress)
+	//wait for 3 seconds to boot up otherwise cancel
+	// 3 seconds gaurd creating a boot context and checking if the task router is ready
+	bootctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	//look for entire start to end then execute this
+	defer cancel()
+
+	taskRouter, err := NewTaskRouter(bootctx, redisAddress)
+	if err != nil {
+		log.Fatalf("failed to create task router: %v", err)
+	}
 
 	//Open the raw TCP socket listener channel on port 50051
 	listener, err := net.Listen("tcp", ":50051")

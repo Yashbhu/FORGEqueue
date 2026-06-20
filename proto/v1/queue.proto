@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package queue.v1;
+
+// Specifies the Go import path and custom shorthand package name (queuev1)
+//affects the code generation (what go package should i put in?) later we an import it
+option go_package = "forgequeue/proto/v1;queuev1";
+
+message EnqueueTaskRequest {
+  string task_type = 1; //binary position 1
+  bytes payload = 2;
+  int32 max_retries = 3;
+  int32 delay_seconds = 4;
+}
+
+message EnqueueTaskResponse {
+  string task_id = 1;
+  string status = 2;
+  int64 timestamp = 3;
+}
+
+service QueueService {
+  rpc EnqueueTask(EnqueueTaskRequest) returns (EnqueueTaskResponse);
+}

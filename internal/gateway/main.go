@@ -81,14 +81,20 @@ func Start() {
 	grpcServer := grpc.NewServer()
 
 	//Register our server implementation with the gRPC engine
-	queuev1.RegisterQueueServiceServer(grpcServer, &server{
-		trouter: taskRouter,
-	})
+	queuev1.RegisterQueueServiceServer(
+		grpcServer,
+		&server{
+			trouter: taskRouter,
+		})
 
 	log.Println("gateway network online on port :50051")
 
 	//Run the infinite network event execution loop
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("critical error running gRPC server loop: %v", err)
-	}
+	// create an anonymous goroutine to serve the gRPC server
+	go func() {
+		err := grpcServer.Serve(listener)
+		if err != nil && err != grpc.ErrServerStopped {
+			log.Fatalf("critical error running gRPC server loop: %v", err)
+		}
+	}()
 }

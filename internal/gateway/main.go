@@ -4,6 +4,9 @@ import (
 	"context"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -72,7 +75,6 @@ func Start() {
 
 	//Open the raw TCP socket listener channel on port 50051
 	listener, err := net.Listen("tcp", ":50051")
-	_ = listener
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -97,4 +99,14 @@ func Start() {
 			log.Fatalf("critical error running gRPC server loop: %v", err)
 		}
 	}()
+	//signal channel to listen for shutdown signals with buffer 1
+	shutdownChan := make(chan os.Signal, 1)
+	//if the process receives an interrupt or termination signal, send it to the shutdown channel
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+	//block the main thrrad until shutdown signal is received
+	sh := <-shutdownChan
+	log.Printf("received shutdown signal: %v", sh)
+	grpcServer.GracefulStop()
+	log.Println("gateway network offline")
+
 }

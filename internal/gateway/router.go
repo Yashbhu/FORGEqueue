@@ -6,37 +6,29 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"forgequeue/internal/model"
+	"forgequeue/internal/redisutil"
 )
 
-type TaskMetaData struct {
-	ID         string `json:"id"`          // 16 byte
-	TaskType   string `json:"task_type"`   // 16 byte
-	Payload    []byte `json:"payload"`     // 24 bytes
-	MaxRetries int32  `json:"max_retries"` // 4 bytes
-}
-
 // task router should be public
+// Every TaskRouter object will have a field named redisClient
 type TaskRouter struct {
 	redisClient *redis.Client // a pointer to the external redis client assigning to the redisclient field
 }
 
 // constructor function which returns a pointer to struct
 // we assign it like router := NewTaskRouter("")
-func NewTaskRouter(addr string, ctx context.Context) (*TaskRouter, error) {
-	// creating a redis client instance
-	client := redis.NewClient(&redis.Options{
-		// redis client returns a pointer
-		Addr:     addr,
-		PoolSize: 50,
-	})
+func NewTaskRouter(ctx context.Context, addr string) (*TaskRouter, error) {
+
 	// fail fast
-	//pinging the redis server to check if it's available
-	err := client.Ping(ctx).Err()
+	//creating the redis client and pinging the redis server to check if it's available
+	client, err := redisutil.NewClient(addr, 50, ctx)
 	if err != nil {
 		return nil, err
 	}
 	return &TaskRouter{ // returns a pointer to a new TaskRouter struct with the redis client assigned to the redisClient field
-		redisClient: client, // created actual task router client value from the instance taking its address as well
+		redisClient: client,
 	}, nil
 }
 
@@ -50,7 +42,7 @@ func (tr *TaskRouter) RouteTask(
 	delaySeconds int64,
 ) error {
 	// creating a struct in memory
-	data := TaskMetaData{
+	data := model.TaskMetaData{
 		ID:         id,
 		TaskType:   taskType,
 		Payload:    payload,

@@ -107,6 +107,7 @@ func Start() {
 	sh := <-shutdownChan
 	log.Printf("received shutdown signal: %v", sh)
 	grpcServer.GracefulStop()
+	//graceful shutdown
 	log.Println("gateway network offline")
 
 }

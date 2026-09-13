@@ -31,8 +31,11 @@ type WorkerPool struct {
 	// Function used to cancel the shared context during shutdown.
 	cancel context.CancelFunc
 
+	//handler is jsut an arbitary value
 	// used to map task types to their corresponding handlers.
 	handlers map[string]TaskHandler
+	// time to wait for a lease before giving up on a task.
+	leaseDuration time.Duration
 }
 
 func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
@@ -59,7 +62,6 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		cancel()
 		return nil, err
 	}
-	handlers := make(map[string]TaskHandler)
 
 	return &WorkerPool{
 		redisClient:      client,
@@ -73,8 +75,9 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		quit: make(chan struct{}),
 
 		// Shared context and its cancellation function.
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:      ctx,
+		cancel:   cancel,
+		handlers: make(map[string]TaskHandler),
 	}, nil
 }
 
@@ -141,6 +144,19 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				task.ID,
 				task.TaskType,
 			)
+			//handler value under key and ok is bool to confirm if key exists or not ( handler would be email or any which comes under taskhandler)
+			// while task.type is the key used to look up the handler in the handlers map which is indeed comes from redis while worker loopup
+			handler, ok := wp.handlers[task.TaskType]
+			if !ok {
+				log.Printf(
+					//place holder %d for base 10 integer and %s for string
+					"worker %d: no handler registered for task type %s",
+					workerID,
+					task.TaskType,
+				)
+				continue
+			}
+
 		}
 	}
 }
@@ -193,7 +209,17 @@ func (wp *WorkerPool) Stop() {
 	wp.wg.Wait()
 }
 
+func (wp *WorkerPool) RegisterHandler(
+	taskType string,
+	handler TaskHandler,
+) {
+	//happens in start where user stores the tasktype in the map
+	// then in redis when a task is received, the task type is used to look up the handler in the map
+	wp.handlers[taskType] = handler
+}
+
 // TaskHandler defines the interface for task handlers.
 type TaskHandler interface {
+	//create a taskhandler type which needs to handle and have these
 	Handle(ctx context.Context, task *model.TaskMetaData) error
 }

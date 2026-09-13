@@ -156,7 +156,18 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				)
 				continue
 			}
+			//execute the handler with the task
+			// handler is just an arbiatry value like x and is used as atype of taskhandelr which have a handler paramter
+			err := handler.Handle(wp.ctx, &task)
 
+			if err != nil {
+				log.Printf(
+					"worker %d: failed to execute task %s: %v",
+					workerID,
+					task.ID,
+					err,
+				)
+			}
 		}
 	}
 }

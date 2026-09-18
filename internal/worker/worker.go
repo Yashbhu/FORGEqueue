@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -75,9 +76,10 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		quit: make(chan struct{}),
 
 		// Shared context and its cancellation function.
-		ctx:      ctx,
-		cancel:   cancel,
-		handlers: make(map[string]TaskHandler),
+		ctx:           ctx,
+		cancel:        cancel,
+		handlers:      make(map[string]TaskHandler),
+		leaseDuration: 10 * time.Second,
 	}, nil
 }
 
@@ -100,35 +102,49 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			//
 			// We use the worker pool's shared context here
 			// so Stop() can cancel this Redis operation.
-			results, err := wp.redisClient.BRPop(
-				wp.ctx,
-				2*time.Second,
-				"queue:tasks:immediate",
-			).Result()
+			taskID, err := wp.claimTask()
 
 			if err != nil {
-				// If the context was cancelled during shutdown,
-				// go back to the top of the loop where the quit
-				// channel will be checked.
+				log.Printf(
+					"worker %d: failed to claim task: %v",
+					workerID,
+					err,
+				)
 				continue
 			}
 
-			// BRPop returns:
-			//
-			// results[0] → list name
-			// results[1] → value stored in the list
-			//
-			// The value is the JSON representation of our task.
+			if taskID == "" {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// Fetch the actual task body we stored with SET.
+			serializedData, err := wp.redisClient.Get(
+				wp.ctx,
+				"task:"+taskID,
+			).Result()
+
+			if err != nil {
+				log.Printf(
+					"worker %d: failed to get task %s: %v",
+					workerID,
+					taskID,
+					err,
+				)
+				continue
+			}
+
 			var task model.TaskMetaData
 
 			// Convert the JSON stored in Redis into TaskMetaData.
 			//
 			// &task gives Unmarshal the address of task so that
 			// it can fill the struct.
-			if err := json.Unmarshal([]byte(results[1]), &task); err != nil {
+			if err := json.Unmarshal([]byte(serializedData), &task); err != nil {
 				log.Printf(
-					"worker %d: failed to parse task: %v",
+					"worker %d: failed to parse task %s: %v",
 					workerID,
+					taskID,
 					err,
 				)
 				continue
@@ -158,7 +174,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			}
 			//execute the handler with the task
 			// handler is just an arbiatry value like x and is used as atype of taskhandelr which have a handler paramter
-			err := handler.Handle(wp.ctx, &task)
+			err = handler.Handle(wp.ctx, &task)
 
 			if err != nil {
 				log.Printf(
@@ -167,7 +183,23 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 					task.ID,
 					err,
 				)
+				continue
 			}
+			// get acknowldgement for the task
+			if err := wp.ackTask(task.ID); err != nil {
+				log.Printf(
+					"worker %d: failed to ACK task %s: %v",
+					workerID,
+					task.ID,
+					err,
+				)
+				continue
+			}
+			log.Printf(
+				"worker %d: successfully executed task %s",
+				workerID,
+				task.ID,
+			)
 		}
 	}
 }
@@ -196,6 +228,11 @@ func (wp *WorkerPool) Start() {
 
 		}(i)
 	}
+	wp.wg.Add(1)
+	go func() {
+		defer wp.wg.Done()
+		wp.recoveryLoop()
+	}()
 }
 
 // Stop gracefully shuts down the worker pool.
@@ -233,4 +270,128 @@ func (wp *WorkerPool) RegisterHandler(
 type TaskHandler interface {
 	//create a taskhandler type which needs to handle and have these
 	Handle(ctx context.Context, task *model.TaskMetaData) error
+}
+
+func (wp *WorkerPool) claimTask() (string, error) {
+	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
+
+	script := redis.NewScript(`
+        local taskID = redis.call("LPOP", KEYS[1])
+
+        if not taskID then
+            return ""
+        end
+
+        redis.call("ZADD", KEYS[2], ARGV[1], taskID)
+
+        return taskID
+    `)
+
+	result, err := script.Run(
+		wp.ctx,
+		wp.redisClient,
+		[]string{
+			"queue:tasks:immediate",
+			"queue:tasks:inflight",
+		},
+		leaseExpiry,
+	).Result()
+
+	if err != nil {
+		return "", err
+	}
+
+	return result.(string), nil
+}
+
+func (wp *WorkerPool) findExpiredTasks() ([]string, error) {
+	now := time.Now().Unix()
+	//key is queue:tasks:inflight to sort them so that the task which get retrivered are <= now which is the time when its gonna expire lease
+	//
+	return wp.redisClient.ZRangeArgs(
+		wp.ctx,
+		redis.ZRangeArgs{
+			Key:   "queue:tasks:inflight",
+			Start: "-inf",
+			//int64 → string using base 10
+			Stop:    strconv.FormatInt(now, 10),
+			ByScore: true,
+		},
+	).Result()
+}
+
+// KEYS[1] → queue:tasks:inflight
+// KEYS[2] → queue:tasks:immediate
+// taskIDs is the slice of task IDs to remove from the inflight queue and add to the immediate queue.
+// // []int{a,b,c} bracket empty in slice
+func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
+	script := redis.NewScript(`
+        local taskID = ARGV[1]
+
+        redis.call("ZREM", KEYS[1], taskID)
+        redis.call("LPUSH", KEYS[2], taskID)
+
+        return taskID
+    `)
+	//ignoring the index and focusing on value
+	// run loop for each task ID to remove it from the inflight queue and add it to the immediate queue.
+	for _, taskID := range taskIDs {
+		_, err := script.Run(
+			wp.ctx,
+			wp.redisClient,
+			[]string{
+				"queue:tasks:inflight",
+				"queue:tasks:immediate",
+			},
+			taskID,
+		).Result()
+
+		if err != nil {
+			return err
+		}
+	}
+	//func successfully no error
+	return nil
+}
+
+func (wp *WorkerPool) recoveryLoop() {
+	//Create a timer that produces an event every 1 second.
+	//
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	// Keep checking for events forever.
+	// Each iteration waits until one of the select cases is ready.
+	for {
+		//until any of these cases are ready
+		select {
+
+		// <- without any vairbale meaning we dont care about value but just signal
+		// //each second ticker.C will produce a signal
+		case <-ticker.C:
+			taskIDs, err := wp.findExpiredTasks()
+			if err != nil {
+				log.Printf("recovery: failed to find expired tasks: %v", err)
+				continue
+			}
+
+			if len(taskIDs) == 0 {
+				continue
+			}
+
+			if err := wp.removeExpiredTasks(taskIDs); err != nil {
+				log.Printf("recovery: failed to requeue expired tasks: %v", err)
+			}
+			//shutdown
+		case <-wp.quit:
+			return
+		}
+	}
+}
+
+func (wp *WorkerPool) ackTask(taskID string) error {
+	return wp.redisClient.ZRem(
+		wp.ctx,
+		"queue:tasks:inflight",
+		taskID,
+	).Err()
 }

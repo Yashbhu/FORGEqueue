@@ -70,14 +70,26 @@ func (tr *TaskRouter) RouteTask(
 		}
 	} else {
 		// if delay seconds is 0 or less we execute the task immediately
-		err := tr.redisClient.LPush(
+		err := tr.redisClient.Set(
 			ctx,
-			"queue:tasks:immediate",
+			"task:"+id,
 			serializedData,
+			0,
 		).Err()
 		if err != nil {
 			return err
 		}
+
+		err = tr.redisClient.LPush(
+			ctx,
+			"queue:tasks:immediate",
+			id,
+		).Err()
+
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }

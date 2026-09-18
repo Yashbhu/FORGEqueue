@@ -1,0 +1,2 @@
+# redis persistence files
+*.rdb

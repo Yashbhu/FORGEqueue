@@ -451,3 +451,43 @@ func (wp *WorkerPool) ackTask(taskID string, leaseID string) error {
 
 	return nil
 }
+
+func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
+	script := redis.NewScript(`
+        local currentLease = redis.call("HGET", KEYS[1], ARGV[1])
+
+        if currentLease ~= ARGV[2] then
+            return 0
+        end
+
+        local newExpiry = redis.call("TIME")[1] + ARGV[3]
+
+        redis.call("ZADD", KEYS[2], newExpiry, ARGV[1])
+
+        return 1
+    `)
+
+	result, err := script.Run(
+		wp.ctx,
+		wp.redisClient,
+		[]string{
+			"queue:tasks:leases",
+			"queue:tasks:inflight",
+		},
+		taskID,
+		leaseID,
+		int64(wp.leaseDuration/time.Second),
+	).Result()
+
+	if err != nil {
+		return err
+	}
+
+	// return 0 means the worker no longer holds the lease,
+	// so the heartbeat is rejected.
+	if result.(int64) == 0 {
+		return errors.New("heartbeat rejected: lease no longer held")
+	}
+
+	return nil
+}

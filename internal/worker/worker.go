@@ -3,11 +3,13 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"forgequeue/internal/model"
@@ -16,7 +18,6 @@ import (
 type WorkerPool struct {
 	redisClient      *redis.Client
 	concurrencyLimit int
-
 	// WaitGroup keeps track of how many workers are still running.
 	// Stop() uses it to wait until every worker has finished.
 	wg sync.WaitGroup
@@ -37,6 +38,12 @@ type WorkerPool struct {
 	handlers map[string]TaskHandler
 	// time to wait for a lease before giving up on a task.
 	leaseDuration time.Duration
+}
+
+type TaskLease struct {
+	//for ownership by defining seperate lease TaskID
+	TaskID  string
+	LeaseID string
 }
 
 func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
@@ -102,8 +109,12 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			//
 			// We use the worker pool's shared context here
 			// so Stop() can cancel this Redis operation.
-			taskID, err := wp.claimTask()
+			lease, err := wp.claimTask()
 
+			if lease == nil {
+				time.Sleep(1 * time.Millisecond)
+				continue
+			}
 			if err != nil {
 				log.Printf(
 					"worker %d: failed to claim task: %v",
@@ -113,7 +124,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				continue
 			}
 
-			if taskID == "" {
+			if lease.TaskID == "" {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -121,14 +132,14 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			// Fetch the actual task body we stored with SET.
 			serializedData, err := wp.redisClient.Get(
 				wp.ctx,
-				"task:"+taskID,
+				"task:"+lease.TaskID,
 			).Result()
 
 			if err != nil {
 				log.Printf(
 					"worker %d: failed to get task %s: %v",
 					workerID,
-					taskID,
+					lease.TaskID,
 					err,
 				)
 				continue
@@ -144,7 +155,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				log.Printf(
 					"worker %d: failed to parse task %s: %v",
 					workerID,
-					taskID,
+					lease.TaskID,
 					err,
 				)
 				continue
@@ -185,8 +196,8 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				)
 				continue
 			}
-			// get acknowldgement for the task
-			if err := wp.ackTask(task.ID); err != nil {
+			// get acknowledgement for the task
+			if err := wp.ackTask(task.ID, lease.LeaseID); err != nil {
 				log.Printf(
 					"worker %d: failed to ACK task %s: %v",
 					workerID,
@@ -272,8 +283,9 @@ type TaskHandler interface {
 	Handle(ctx context.Context, task *model.TaskMetaData) error
 }
 
-func (wp *WorkerPool) claimTask() (string, error) {
+func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
+	leaseID := uuid.New().String()
 
 	script := redis.NewScript(`
         local taskID = redis.call("LPOP", KEYS[1])
@@ -284,6 +296,8 @@ func (wp *WorkerPool) claimTask() (string, error) {
 
         redis.call("ZADD", KEYS[2], ARGV[1], taskID)
 
+        redis.call("HSET", KEYS[3], taskID, ARGV[2])
+
         return taskID
     `)
 
@@ -293,15 +307,25 @@ func (wp *WorkerPool) claimTask() (string, error) {
 		[]string{
 			"queue:tasks:immediate",
 			"queue:tasks:inflight",
+			"queue:tasks:leases",
 		},
 		leaseExpiry,
+		leaseID,
 	).Result()
 
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return result.(string), nil
+	// The script returns an empty string when the queue is empty.
+	if result == "" {
+		return nil, nil
+	}
+
+	return &TaskLease{
+		TaskID:  result.(string),
+		LeaseID: leaseID,
+	}, nil
 }
 
 func (wp *WorkerPool) findExpiredTasks() ([]string, error) {
@@ -324,6 +348,8 @@ func (wp *WorkerPool) findExpiredTasks() ([]string, error) {
 // KEYS[2] → queue:tasks:immediate
 // taskIDs is the slice of task IDs to remove from the inflight queue and add to the immediate queue.
 // // []int{a,b,c} bracket empty in slice
+// //KEYS = Redis keys that the script is going to operate on.
+// ARGV = ordinary values the script needs.
 func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
 	script := redis.NewScript(`
         local taskID = ARGV[1]
@@ -388,10 +414,40 @@ func (wp *WorkerPool) recoveryLoop() {
 	}
 }
 
-func (wp *WorkerPool) ackTask(taskID string) error {
-	return wp.redisClient.ZRem(
+func (wp *WorkerPool) ackTask(taskID string, leaseID string) error {
+	script := redis.NewScript(`
+        local currentLease = redis.call("HGET", KEYS[2], ARGV[1])
+
+        if currentLease ~= ARGV[2] then
+            return 0
+        end
+
+        redis.call("ZREM", KEYS[1], ARGV[1])
+        redis.call("HDEL", KEYS[2], ARGV[1])
+
+        return 1
+    `)
+
+	result, err := script.Run(
 		wp.ctx,
-		"queue:tasks:inflight",
+		wp.redisClient,
+		[]string{
+			"queue:tasks:inflight",
+			"queue:tasks:leases",
+		},
 		taskID,
-	).Err()
+		leaseID,
+	).Result()
+
+	if err != nil {
+		return err
+	}
+
+	// return 0 means the worker no longer holds the lease,
+	// so the ACK is rejected.
+	if result.(int64) == 0 {
+		return errors.New("ack rejected: lease no longer held")
+	}
+
+	return nil
 }

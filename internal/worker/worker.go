@@ -211,6 +211,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				heartbeatCtx,
 				lease.TaskID,
 				lease.LeaseID,
+				cancelTask,
 			)
 
 			err = handler.Handle(taskCtx, &task)
@@ -582,11 +583,14 @@ func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
 // never expires while it's still making progress.
 //
 // It stops either when the per-task context is cancelled (the handler
-// finished) or when a heartbeat is rejected (the lease was lost).
+// finished) or when a heartbeat is rejected (the lease was lost). When the
+// lease is lost, it also cancels the task context so the running handler
+// is told to stop early.
 func (wp *WorkerPool) heartbeatLoop(
 	ctx context.Context,
 	taskID string,
 	leaseID string,
+	cancelTask context.CancelFunc,
 ) {
 	ticker := time.NewTicker(wp.leaseDuration / 3)
 	defer ticker.Stop()
@@ -600,6 +604,8 @@ func (wp *WorkerPool) heartbeatLoop(
 					taskID,
 					err,
 				)
+
+				cancelTask()
 				return
 			}
 

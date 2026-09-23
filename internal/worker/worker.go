@@ -16,7 +16,9 @@ import (
 )
 
 type WorkerPool struct {
-	redisClient      *redis.Client
+	// The shared Redis client used for all queue operations.
+	redisClient *redis.Client
+	// Number of worker goroutines that process tasks in parallel.
 	concurrencyLimit int
 	// WaitGroup keeps track of how many workers are still running.
 	// Stop() uses it to wait until every worker has finished.
@@ -40,8 +42,12 @@ type WorkerPool struct {
 	leaseDuration time.Duration
 }
 
+// TaskLease is the proof of ownership a worker holds over a claimed task.
+//
+// TaskID identifies the task. LeaseID is a unique token generated at claim
+// time; Redis stores the pair in the leases hash so later operations
+// (heartbeat, ACK) can verify this worker still owns the task.
 type TaskLease struct {
-	//for ownership by defining seperate lease TaskID
 	TaskID  string
 	LeaseID string
 }
@@ -111,6 +117,8 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			// so Stop() can cancel this Redis operation.
 			lease, err := wp.claimTask()
 
+			// claimTask returns nil when the queue is empty.
+			// Sleep briefly so workers don't spin hot on an idle queue.
 			if lease == nil {
 				time.Sleep(1 * time.Millisecond)
 				continue
@@ -124,6 +132,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				continue
 			}
 
+			// Defensive guard: a claimed task must always have an ID.
 			if lease.TaskID == "" {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -171,21 +180,45 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				task.ID,
 				task.TaskType,
 			)
-			//handler value under key and ok is bool to confirm if key exists or not ( handler would be email or any which comes under taskhandler)
-			// while task.type is the key used to look up the handler in the handlers map which is indeed comes from redis while worker loopup
+			// Look up the handler for this task's type.
+			//
+			// ok is true when a handler was registered for task.TaskType
+			// (e.g. "email"). If none is registered, the task can't be
+			// processed, so skip it and let it expire/requeue.
 			handler, ok := wp.handlers[task.TaskType]
 			if !ok {
 				log.Printf(
-					//place holder %d for base 10 integer and %s for string
 					"worker %d: no handler registered for task type %s",
 					workerID,
 					task.TaskType,
 				)
 				continue
 			}
-			//execute the handler with the task
-			// handler is just an arbiatry value like x and is used as atype of taskhandelr which have a handler paramter
-			err = handler.Handle(wp.ctx, &task)
+
+			// This task's own cancellation signal. If the lease is lost
+			// mid-execution, this context can be cancelled so the handler
+			// has a chance to stop early.
+			taskCtx, cancelTask := context.WithCancel(wp.ctx)
+			defer cancelTask()
+
+			// A per-task context so cancelling it only stops this
+			// task's heartbeat, not the whole worker pool.
+			heartbeatCtx, stopHeartbeat := context.WithCancel(wp.ctx)
+
+			// Run the heartbeat in the background while the handler
+			// is executing, so the lease is renewed for long tasks.
+			go wp.heartbeatLoop(
+				heartbeatCtx,
+				lease.TaskID,
+				lease.LeaseID,
+			)
+
+			err = handler.Handle(taskCtx, &task)
+
+			// Stop the heartbeats as soon as this execution attempt
+			// is over, even if the handler failed. The attempt is done,
+			// so renewing the lease would only delay recovery.
+			stopHeartbeat()
 
 			if err != nil {
 				log.Printf(
@@ -239,6 +272,9 @@ func (wp *WorkerPool) Start() {
 
 		}(i)
 	}
+	// The recovery loop runs separately from the workers: it has its own
+	// goroutine so it keeps requeueing expired tasks even while every
+	// worker is busy executing.
 	wp.wg.Add(1)
 	go func() {
 		defer wp.wg.Done()
@@ -283,10 +319,19 @@ type TaskHandler interface {
 	Handle(ctx context.Context, task *model.TaskMetaData) error
 }
 
+// claimTask pops a task off the immediate queue and claims ownership of it.
+//
+// This is one atomic Lua script, so there's no gap between popping the task
+// and registering it as in-flight/owned.
 func (wp *WorkerPool) claimTask() (*TaskLease, error) {
+	// The expiry is the deadline for the lease. If the worker doesn't
+	// ACK or heartbeat before this, recovery will requeue the task.
 	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
 	leaseID := uuid.New().String()
 
+	// KEYS[1] → queue:tasks:immediate  (source of ready tasks)
+	// KEYS[2] → queue:tasks:inflight   (sorted set: taskID → expiry)
+	// KEYS[3] → queue:tasks:leases     (hash: taskID → leaseID)
 	script := redis.NewScript(`
         local taskID = redis.call("LPOP", KEYS[1])
 
@@ -328,39 +373,57 @@ func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 	}, nil
 }
 
+// findExpiredTasks returns the task IDs whose lease has expired.
+//
+// The inflight sorted set stores taskID → lease expiry. Asking for
+// everything between "-inf" and the current Unix time ("now") returns
+// exactly the tasks whose deadline has passed and are ready for requeue.
 func (wp *WorkerPool) findExpiredTasks() ([]string, error) {
 	now := time.Now().Unix()
-	//key is queue:tasks:inflight to sort them so that the task which get retrivered are <= now which is the time when its gonna expire lease
-	//
 	return wp.redisClient.ZRangeArgs(
 		wp.ctx,
 		redis.ZRangeArgs{
 			Key:   "queue:tasks:inflight",
 			Start: "-inf",
-			//int64 → string using base 10
+			// Stop is an integer, so it has to be converted to a string.
 			Stop:    strconv.FormatInt(now, 10),
 			ByScore: true,
 		},
 	).Result()
 }
 
+// removeExpiredTasks returns expired tasks to the immediate queue.
+//
+// findExpiredTasks() only produces candidates: the scan can go stale, since
+// a heartbeat may renew the lease between the scan and this call. So this
+// function re-checks the expiry inside Redis, atomically, right before
+// requeueing. If the task is no longer expired, it's left alone.
+//
 // KEYS[1] → queue:tasks:inflight
 // KEYS[2] → queue:tasks:immediate
-// taskIDs is the slice of task IDs to remove from the inflight queue and add to the immediate queue.
-// // []int{a,b,c} bracket empty in slice
-// //KEYS = Redis keys that the script is going to operate on.
-// ARGV = ordinary values the script needs.
+// KEYS[3] → queue:tasks:leases
+// ARGV[1] → the task ID to requeue
 func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
 	script := redis.NewScript(`
-        local taskID = ARGV[1]
+        local expiry = redis.call("ZSCORE", KEYS[1], ARGV[1])
 
-        redis.call("ZREM", KEYS[1], taskID)
-        redis.call("LPUSH", KEYS[2], taskID)
+        if not expiry then
+            return 0
+        end
 
-        return taskID
+        local now = redis.call("TIME")[1]
+
+        if tonumber(expiry) > tonumber(now) then
+            return 0
+        end
+
+        redis.call("ZREM", KEYS[1], ARGV[1])
+        redis.call("HDEL", KEYS[3], ARGV[1])
+        redis.call("LPUSH", KEYS[2], ARGV[1])
+
+        return 1
     `)
-	//ignoring the index and focusing on value
-	// run loop for each task ID to remove it from the inflight queue and add it to the immediate queue.
+	// Requeue each expired task, one Lua call at a time.
 	for _, taskID := range taskIDs {
 		_, err := script.Run(
 			wp.ctx,
@@ -368,6 +431,7 @@ func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
 			[]string{
 				"queue:tasks:inflight",
 				"queue:tasks:immediate",
+				"queue:tasks:leases",
 			},
 			taskID,
 		).Result()
@@ -376,23 +440,21 @@ func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
 			return err
 		}
 	}
-	//func successfully no error
 	return nil
 }
 
+// recoveryLoop watches for expired leases and requeues them.
+//
+// Every second it asks Redis which in-flight tasks have expired and moves
+// those back to the immediate queue for another attempt. It runs in its
+// own goroutine and stops when the pool shuts down.
 func (wp *WorkerPool) recoveryLoop() {
-	//Create a timer that produces an event every 1 second.
-	//
+	// Re-check for expired tasks once per second.
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	// Keep checking for events forever.
-	// Each iteration waits until one of the select cases is ready.
-	for {
-		//until any of these cases are ready
-		select {
 
-		// <- without any vairbale meaning we dont care about value but just signal
-		// //each second ticker.C will produce a signal
+	for {
+		select {
 		case <-ticker.C:
 			taskIDs, err := wp.findExpiredTasks()
 			if err != nil {
@@ -407,13 +469,23 @@ func (wp *WorkerPool) recoveryLoop() {
 			if err := wp.removeExpiredTasks(taskIDs); err != nil {
 				log.Printf("recovery: failed to requeue expired tasks: %v", err)
 			}
-			//shutdown
+
 		case <-wp.quit:
 			return
 		}
 	}
 }
 
+// ackTask tells Redis that a task finished successfully.
+//
+// It only removes the task if the presented leaseID still matches the owner
+// stored in the leases hash. That way an ACK from a worker whose lease was
+// overwritten (e.g. the task was requeued after expiry) is rejected.
+//
+// KEYS[1] → queue:tasks:inflight (sorted set: taskID → expiry)
+// KEYS[2] → queue:tasks:leases   (hash: taskID → leaseID)
+// ARGV[1] → taskID
+// ARGV[2] → leaseID presented by the worker
 func (wp *WorkerPool) ackTask(taskID string, leaseID string) error {
 	script := redis.NewScript(`
         local currentLease = redis.call("HGET", KEYS[2], ARGV[1])
@@ -452,6 +524,17 @@ func (wp *WorkerPool) ackTask(taskID string, leaseID string) error {
 	return nil
 }
 
+// heartbeat renews the lease for a task that is still being processed.
+//
+// It checks ownership first (HGET) and, if the worker still owns the task,
+// pushes the expiry forward using Redis's own clock rather than the
+// worker's clock.
+//
+// KEYS[1] → queue:tasks:leases   (hash: taskID → leaseID)
+// KEYS[2] → queue:tasks:inflight (sorted set: taskID → expiry)
+// ARGV[1] → taskID
+// ARGV[2] → leaseID presented by the worker
+// ARGV[3] → lease duration in seconds
 func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
 	script := redis.NewScript(`
         local currentLease = redis.call("HGET", KEYS[1], ARGV[1])
@@ -490,4 +573,38 @@ func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
 	}
 
 	return nil
+}
+
+// heartbeatLoop keeps a task's lease alive while it is being handled.
+//
+// heartbeat() extends the lease once; this loop calls it repeatedly at a
+// fraction of the lease duration (leaseDuration / 3) so a long-running task
+// never expires while it's still making progress.
+//
+// It stops either when the per-task context is cancelled (the handler
+// finished) or when a heartbeat is rejected (the lease was lost).
+func (wp *WorkerPool) heartbeatLoop(
+	ctx context.Context,
+	taskID string,
+	leaseID string,
+) {
+	ticker := time.NewTicker(wp.leaseDuration / 3)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := wp.heartbeat(taskID, leaseID); err != nil {
+				log.Printf(
+					"heartbeat failed for task %s: %v",
+					taskID,
+					err,
+				)
+				return
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
 }

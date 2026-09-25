@@ -313,12 +313,12 @@ func (wp *WorkerPool) claimTask() (*TaskClaim, error) {
 	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
 	leaseID := uuid.New().String()
 
-	// KEYS[1] → queue:tasks:immediate  (source of ready tasks)
-	// KEYS[2] → queue:tasks:inflight   (sorted set: taskID → expiry)
-	// KEYS[3] → queue:tasks:leases     (hash: taskID → leaseID)
-	// ARGV[1] → lease expiry (Unix seconds)
-	// ARGV[2] → leaseID (ownership token)
-	// ARGV[3] → "task:" prefix used to build the body's key
+	// KEYS[1] -> queue:tasks:immediate  (source of ready tasks)
+	// KEYS[2] -> queue:tasks:inflight   (sorted set: taskID → expiry)
+	// KEYS[3] -> queue:tasks:leases     (hash: taskID → leaseID)
+	// ARGV[1] -> lease expiry (Unix seconds)
+	// ARGV[2] -> leaseID (ownership token)
+	// ARGV[3] -> "task:" prefix used to build the body's key
 	script := redis.NewScript(`
         local taskID = redis.call("LPOP", KEYS[1])
 

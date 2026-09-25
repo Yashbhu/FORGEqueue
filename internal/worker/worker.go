@@ -52,6 +52,14 @@ type TaskLease struct {
 	LeaseID string
 }
 
+// TaskClaim is what a worker receives from claimTask(): the ownership lease
+// plus the task's JSON body. The claim Lua script reads the body in the same
+// atomic call, so fetching it does not cost a second round trip to Redis.
+type TaskClaim struct {
+	TaskLease
+	Body []byte
+}
+
 func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 	// Create the Redis client used by all workers.
 	client := redis.NewClient(&redis.Options{
@@ -108,13 +116,6 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			return
 
 		default:
-			// Wait for a task in Redis.
-			//
-			// BRPop blocks until a task is available or
-			// the timeout expires.
-			//
-			// We use the worker pool's shared context here
-			// so Stop() can cancel this Redis operation.
 			lease, err := wp.claimTask()
 
 			// claimTask returns nil when the queue is empty.
@@ -138,18 +139,13 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				continue
 			}
 
-			// Fetch the actual task body we stored with SET.
-			serializedData, err := wp.redisClient.Get(
-				wp.ctx,
-				"task:"+lease.TaskID,
-			).Result()
-
-			if err != nil {
+			// The task body was already read by the claim script.
+			// An empty body means the task data was missing.
+			if len(lease.Body) == 0 {
 				log.Printf(
-					"worker %d: failed to get task %s: %v",
+					"worker %d: failed to get task %s: no task body",
 					workerID,
 					lease.TaskID,
-					err,
 				)
 				continue
 			}
@@ -160,7 +156,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			//
 			// &task gives Unmarshal the address of task so that
 			// it can fill the struct.
-			if err := json.Unmarshal([]byte(serializedData), &task); err != nil {
+			if err := json.Unmarshal(lease.Body, &task); err != nil {
 				log.Printf(
 					"worker %d: failed to parse task %s: %v",
 					workerID,
@@ -170,16 +166,6 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				continue
 			}
 
-			// For now, we only confirm that the worker successfully
-			// dequeued and parsed the task.
-			//
-			// Actual task execution will be added later.
-			log.Printf(
-				"worker %d: dequeued task %s (%s)",
-				workerID,
-				task.ID,
-				task.TaskType,
-			)
 			// Look up the handler for this task's type.
 			//
 			// ok is true when a handler was registered for task.TaskType
@@ -240,11 +226,6 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				)
 				continue
 			}
-			log.Printf(
-				"worker %d: successfully executed task %s",
-				workerID,
-				task.ID,
-			)
 		}
 	}
 }
@@ -320,11 +301,13 @@ type TaskHandler interface {
 	Handle(ctx context.Context, task *model.TaskMetaData) error
 }
 
-// claimTask pops a task off the immediate queue and claims ownership of it.
+// claimTask pops a task off the immediate queue, claims ownership of it,
+// and reads its body — all in one atomic Lua script.
 //
-// This is one atomic Lua script, so there's no gap between popping the task
-// and registering it as in-flight/owned.
-func (wp *WorkerPool) claimTask() (*TaskLease, error) {
+// Every task costs two Redis round trips instead of three: the claim script
+// returns the lease (ID + ownership token) together with the stored JSON body,
+// so the worker never sends a separate GET for it.
+func (wp *WorkerPool) claimTask() (*TaskClaim, error) {
 	// The expiry is the deadline for the lease. If the worker doesn't
 	// ACK or heartbeat before this, recovery will requeue the task.
 	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
@@ -333,6 +316,9 @@ func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 	// KEYS[1] → queue:tasks:immediate  (source of ready tasks)
 	// KEYS[2] → queue:tasks:inflight   (sorted set: taskID → expiry)
 	// KEYS[3] → queue:tasks:leases     (hash: taskID → leaseID)
+	// ARGV[1] → lease expiry (Unix seconds)
+	// ARGV[2] → leaseID (ownership token)
+	// ARGV[3] → "task:" prefix used to build the body's key
 	script := redis.NewScript(`
         local taskID = redis.call("LPOP", KEYS[1])
 
@@ -344,7 +330,9 @@ func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 
         redis.call("HSET", KEYS[3], taskID, ARGV[2])
 
-        return taskID
+        local body = redis.call("GET", ARGV[3] .. taskID)
+
+        return {taskID, body}
     `)
 
 	result, err := script.Run(
@@ -357,6 +345,7 @@ func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 		},
 		leaseExpiry,
 		leaseID,
+		"task:",
 	).Result()
 
 	if err != nil {
@@ -368,9 +357,23 @@ func (wp *WorkerPool) claimTask() (*TaskLease, error) {
 		return nil, nil
 	}
 
-	return &TaskLease{
-		TaskID:  result.(string),
-		LeaseID: leaseID,
+	// Otherwise it returns {taskID, body}.
+	values := result.([]interface{})
+	if len(values) < 2 {
+		return nil, errors.New("claim script returned malformed result")
+	}
+
+	body := ""
+	if values[1] != nil {
+		body = values[1].(string)
+	}
+
+	return &TaskClaim{
+		TaskLease: TaskLease{
+			TaskID:  values[0].(string),
+			LeaseID: leaseID,
+		},
+		Body: []byte(body),
 	}, nil
 }
 

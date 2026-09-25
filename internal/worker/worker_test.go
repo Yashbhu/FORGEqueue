@@ -220,3 +220,49 @@ func BenchmarkWorkerThroughput(b *testing.B) {
 	}
 	b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "tasks/sec")
 }
+
+// BenchmarkWorkerThroughputPreloaded measures processing throughput only:
+// all N tasks are enqueued before timing starts, so the timer captures the
+// pure drain rate (no enqueue work pollutes the measurement).
+func BenchmarkWorkerThroughputPreloaded(b *testing.B) {
+	wp, err := NewWorkerPool(testRedisAddr, 4)
+	if err != nil {
+		b.Fatalf("new worker pool: %v", err)
+	}
+	wp.leaseDuration = time.Second
+	wp.RegisterHandler("noop", noopHandler{})
+
+	if err := wp.redisClient.FlushDB(context.Background()).Err(); err != nil {
+		b.Fatalf("flush db: %v", err)
+	}
+
+	// Enqueue all N tasks before timing begins.
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("bench-%d", i)
+		if err := wp.redisClient.Set(wp.ctx, "task:"+id, `{"id":"`+id+`","task_type":"noop"}`, 0).Err(); err != nil {
+			b.Fatalf("set task %d: %v", i, err)
+		}
+		if err := wp.redisClient.LPush(wp.ctx, "queue:tasks:immediate", id).Err(); err != nil {
+			b.Fatalf("enqueue task %d: %v", i, err)
+		}
+	}
+
+	wp.Start()
+	defer wp.Stop()
+
+	b.ResetTimer()
+	total := int64(b.N)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if (llen(b, wp, "queue:tasks:immediate") + zcard(b, wp, "queue:tasks:inflight")) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	b.StopTimer()
+
+	if n := llen(b, wp, "queue:tasks:immediate") + zcard(b, wp, "queue:tasks:inflight"); n != 0 {
+		b.Fatalf("pool failed to drain %d task(s) within timeout", n)
+	}
+	b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "tasks/sec")
+}

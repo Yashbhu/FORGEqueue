@@ -1,2 +1,5 @@
 # redis persistence files
 *.rdb
+
+# macos
+.DS_Store

@@ -10,10 +10,8 @@ There are no external "hard" dependencies beyond Go and a single Redis
 instance. The queue is a library (`internal/worker`) plus a gRPC ingestion
 gateway (`internal/gateway`); there is no separate worker binary yet.
 
-```
 Client -> Gateway -> Redis -> Worker pool -> Your handler
-                 (router)   (queue)   (consumers)
-```
+          (router)   (queue)   (consumers)
 
 ## Architecture
 

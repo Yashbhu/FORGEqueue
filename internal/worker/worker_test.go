@@ -90,10 +90,17 @@ func (h *countingHandler) Count() int {
 
 func enqueueTask(t *testing.T, wp *WorkerPool, taskID string, maxRetries int32) {
 	t.Helper()
+	enqueueTaskOfType(t, wp, taskID, "noop", maxRetries)
+}
+
+// enqueueTaskOfType is enqueueTask but for a specific task type, so tests can
+// send different kinds of work through the same pool.
+func enqueueTaskOfType(t *testing.T, wp *WorkerPool, taskID string, taskType string, maxRetries int32) {
+	t.Helper()
 
 	data, err := json.Marshal(model.TaskMetaData{
 		ID:         taskID,
-		TaskType:   "noop",
+		TaskType:   taskType,
 		MaxRetries: maxRetries,
 	})
 	if err != nil {
@@ -313,6 +320,85 @@ func TestWorkerDelayedTaskPromotion(t *testing.T) {
 	})
 }
 
+// TestWorkerBatchClaimsAndAcks verifies the batched path with batchSize > 1:
+// a whole batch is claimed in one script and every task in it is ACKed
+// exactly once. No task may be processed twice and no task may be dropped.
+func TestWorkerBatchClaimsAndAcks(t *testing.T) {
+	wp, err := NewWorkerPool(testRedisAddr, 1)
+	if err != nil {
+		t.Fatalf("new worker pool: %v", err)
+	}
+	wp.leaseDuration = 200 * time.Millisecond
+	wp.backoffBase = 200 * time.Millisecond
+	handler := &countingHandler{}
+	wp.RegisterHandler("noop", handler)
+	wp.WithBatchSize(8)
+
+	if err := wp.redisClient.FlushDB(wp.ctx).Err(); err != nil {
+		t.Fatalf("flush db: %v", err)
+	}
+
+	const n = 8
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uuid.NewString()
+		enqueueTask(t, wp, ids[i], 0)
+	}
+
+	wp.Start()
+	defer wp.Stop()
+
+	waitFor(t, 8*time.Second, "entire batch to be processed and ACKed", func() bool {
+		return handler.Count() == n &&
+			llen(t, wp, "queue:tasks:immediate") == 0 &&
+			zcard(t, wp, "queue:tasks:inflight") == 0
+	})
+
+	// Give recovery a chance to wrongly re-run anything.
+	time.Sleep(2 * time.Second)
+	if got := handler.Count(); got != n {
+		t.Fatalf("handler ran %d times, want exactly %d", got, n)
+	}
+}
+
+// TestWorkerBatchMixedSuccessAndFailure puts good and failing tasks in the
+// same batch: a failing task fast-fails into the dead-letter queue while its
+// healthy batch-mates are still ACKed in one go.
+func TestWorkerBatchMixedSuccessAndFailure(t *testing.T) {
+	wp, err := NewWorkerPool(testRedisAddr, 1)
+	if err != nil {
+		t.Fatalf("new worker pool: %v", err)
+	}
+	wp.leaseDuration = 200 * time.Millisecond
+	wp.backoffBase = 200 * time.Millisecond
+	good := &countingHandler{}
+	bad := &alwaysFailHandler{}
+	wp.RegisterHandler("good", good)
+	wp.RegisterHandler("bad", bad)
+	wp.WithBatchSize(4)
+
+	if err := wp.redisClient.FlushDB(wp.ctx).Err(); err != nil {
+		t.Fatalf("flush db: %v", err)
+	}
+
+	// 3 good tasks and 1 task doomed from the start (budget burns out on
+	// its first run).
+	enqueueTaskOfType(t, wp, uuid.NewString(), "good", 3)
+	enqueueTaskOfType(t, wp, uuid.NewString(), "good", 3)
+	enqueueTaskOfType(t, wp, uuid.NewString(), "good", 3)
+	enqueueTaskOfType(t, wp, uuid.NewString(), "bad", 1)
+
+	wp.Start()
+	defer wp.Stop()
+
+	waitFor(t, 8*time.Second, "good tasks ACKed and bad task dead-lettered", func() bool {
+		return good.Count() == 3 &&
+			bad.Count() == 1 &&
+			llen(t, wp, "queue:tasks:dead") == 1 &&
+			zcard(t, wp, "queue:tasks:inflight") == 0
+	})
+}
+
 // BenchmarkWorkerThroughput measures end-to-end throughput:
 // enqueue N tasks, let the pool process them, report tasks/sec.
 func BenchmarkWorkerThroughput(b *testing.B) {
@@ -344,6 +430,54 @@ func BenchmarkWorkerThroughput(b *testing.B) {
 		}
 	}
 
+	total := int64(b.N)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if (llen(b, wp, "queue:tasks:immediate") + zcard(b, wp, "queue:tasks:inflight")) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	b.StopTimer()
+
+	if n := llen(b, wp, "queue:tasks:immediate") + zcard(b, wp, "queue:tasks:inflight"); n != 0 {
+		b.Fatalf("pool failed to drain %d task(s) within timeout", n)
+	}
+	b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "tasks/sec")
+}
+
+// BenchmarkWorkerThroughputBatched is the same preloaded drain as
+// BenchmarkWorkerThroughputPreloaded but with the batch path enabled: each
+// worker claims up to 16 tasks and ACKs 16 tasks per round trip.
+func BenchmarkWorkerThroughputBatched(b *testing.B) {
+	wp, err := NewWorkerPool(testRedisAddr, 4)
+	if err != nil {
+		b.Fatalf("new worker pool: %v", err)
+	}
+	wp.leaseDuration = time.Second
+	wp.RegisterHandler("noop", noopHandler{})
+	wp.WithBatchSize(16)
+
+	if err := wp.redisClient.FlushDB(context.Background()).Err(); err != nil {
+		b.Fatalf("flush db: %v", err)
+	}
+
+	// Enqueue all N tasks before timing begins, exactly like the preloaded
+	// benchmark so the two can be compared.
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("bench-%d", i)
+		if err := wp.redisClient.Set(wp.ctx, "task:"+id, `{"id":"`+id+`","task_type":"noop"}`, 0).Err(); err != nil {
+			b.Fatalf("set task %d: %v", i, err)
+		}
+		if err := wp.redisClient.LPush(wp.ctx, "queue:tasks:immediate", id).Err(); err != nil {
+			b.Fatalf("enqueue task %d: %v", i, err)
+		}
+	}
+
+	wp.Start()
+	defer wp.Stop()
+
+	b.ResetTimer()
 	total := int64(b.N)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {

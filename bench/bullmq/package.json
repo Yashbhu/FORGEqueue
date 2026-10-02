@@ -1,0 +1,12 @@
+{
+  "name": "forgequeue-bullmq-bench",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Same-machine BullMQ comparison harness for ForgeQueue benchmarks",
+  "scripts": {
+    "bench": "node bench.js"
+  },
+  "dependencies": {
+    "bullmq": "^5"
+  }
+}

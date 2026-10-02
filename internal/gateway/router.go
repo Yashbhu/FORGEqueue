@@ -7,6 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"forgequeue/internal/durable"
 	"forgequeue/internal/model"
 	"forgequeue/internal/redisutil"
 )
@@ -15,6 +16,10 @@ import (
 // Every TaskRouter object will have a field named redisClient
 type TaskRouter struct {
 	redisClient *redis.Client // a pointer to the external redis client assigning to the redisclient field
+	// durable journal (Postgres). It records every accepted task BEFORE
+	// Redis is touched, so a crash mid-enqueue never loses the task - the
+	// reconciler finishes the write. Nop by default (no database configured).
+	store durable.Store
 }
 
 // constructor function which returns a pointer to struct
@@ -29,7 +34,16 @@ func NewTaskRouter(ctx context.Context, addr string) (*TaskRouter, error) {
 	}
 	return &TaskRouter{ // returns a pointer to a new TaskRouter struct with the redis client assigned to the redisClient field
 		redisClient: client,
+		store:       durable.Nop{},
 	}, nil
+}
+
+// WithStore attaches the durable journal to the router. Call it before
+// serving requests. Tasks are journaled first and materialized into Redis
+// afterwards; a crash in between is repaired by the reconciler.
+func (tr *TaskRouter) WithStore(s durable.Store) *TaskRouter {
+	tr.store = s
+	return tr
 }
 
 // method belonging to taskrouter we call it like tr.routeTask it doesnt exist itself
@@ -58,6 +72,20 @@ func (tr *TaskRouter) RouteTask(
 	if delaySeconds > 0 {
 		targetTime := time.Now().Unix() + delaySeconds
 
+		// Journal the task first. If we die before the Redis writes below,
+		// the reconciler sees redis_pending and materializes the task for
+		// us. This is the whole "journal first, then hot store" order.
+		if err := tr.store.Enqueue(ctx, durable.Task{
+			ID:         id,
+			TaskType:   taskType,
+			Payload:    serializedData,
+			MaxRetries: maxRetries,
+			State:      durable.StateEnqueued,
+			ScheduleAt: time.Unix(targetTime, 0),
+		}); err != nil {
+			return err
+		}
+
 		// Write the body first so it is already in place when the worker's
 		// promotion loop moves the ID out of the scheduled set. The scheduled
 		// set only stores the task ID, matching the immediate path: the body
@@ -83,28 +111,42 @@ func (tr *TaskRouter) RouteTask(
 		if err != nil {
 			return err
 		}
-	} else {
-		// if delay seconds is 0 or less we execute the task immediately
-		err := tr.redisClient.Set(
-			ctx,
-			"task:"+id,
-			serializedData,
-			0,
-		).Err()
-		if err != nil {
-			return err
-		}
 
-		err = tr.redisClient.LPush(
-			ctx,
-			"queue:tasks:immediate",
-			id,
-		).Err()
-
-		if err != nil {
-			return err
-		}
+		// Redis now provably holds the task; the journal can stop treating
+		// it as pending.
+		return tr.store.Materialized(ctx, id)
 	}
 
-	return nil
+	// immediate enqueue.
+	if err := tr.store.Enqueue(ctx, durable.Task{
+		ID:         id,
+		TaskType:   taskType,
+		Payload:    serializedData,
+		MaxRetries: maxRetries,
+		State:      durable.StateEnqueued,
+	}); err != nil {
+		return err
+	}
+
+	err = tr.redisClient.Set(
+		ctx,
+		"task:"+id,
+		serializedData,
+		0,
+	).Err()
+	if err != nil {
+		return err
+	}
+
+	err = tr.redisClient.LPush(
+		ctx,
+		"queue:tasks:immediate",
+		id,
+	).Err()
+
+	if err != nil {
+		return err
+	}
+
+	return tr.store.Materialized(ctx, id)
 }

@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	// Absolute structural paths using your go.mod module name:
+	"forgequeue/internal/durable"
 	queuev1 "forgequeue/proto/v1"
 )
 
@@ -60,7 +61,7 @@ func (s *server) EnqueueTask(
 
 // raw netowrk listener socket opening
 func Start() {
-	//Initialize your custom Redis connection pool pointer
+	// Initialize your custom Redis connection pool pointer
 	redisAddress := "localhost:6379"
 	//wait for 3 seconds to boot up otherwise cancel
 	// 3 seconds gaurd creating a boot context and checking if the task router is ready
@@ -71,6 +72,21 @@ func Start() {
 	taskRouter, err := NewTaskRouter(bootctx, redisAddress)
 	if err != nil {
 		log.Fatalf("failed to create task router: %v", err)
+	}
+
+	// The durable journal is optional and opt-in: set FORGEQUEUE_PG_DSN and
+	// every enqueue is journaled to Postgres first (survives crashes, heals
+	// Redis), otherwise the gateway runs Redis-only exactly as before.
+	if dsn := os.Getenv("FORGEQUEUE_PG_DSN"); dsn != "" {
+		store, err := durable.NewPostgres(bootctx, dsn)
+		if err != nil {
+			log.Fatalf("failed to connect durable store: %v", err)
+		}
+		defer store.Close()
+		taskRouter.WithStore(store)
+		log.Println("durable journal online (postgres)")
+	} else {
+		log.Println("durable journal disabled (set FORGEQUEUE_PG_DSN to enable)")
 	}
 
 	//Open the raw TCP socket listener channel on port 50051

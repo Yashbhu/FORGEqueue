@@ -7,7 +7,8 @@ heartbeats, crash recovery, and ownership fencing — by implementing them
 yourself instead of reaching for an off-the-shelf system.
 
 There are no external "hard" dependencies beyond Go and a single Redis
-instance. The queue is a library (`internal/worker`) plus a gRPC ingestion
+instance. Postgres is optional: set `FORGEQUEUE_PG_DSN` to turn on the durable
+journal. The queue is a library (`internal/worker`) plus a gRPC ingestion
 gateway (`internal/gateway`); there is no separate worker binary yet.
 
 Client -> Gateway -> Redis -> Worker pool -> Your handler
@@ -34,6 +35,13 @@ internal/redisutil/ Thin wrapper around go-redis: builds a client and fails
                     fast with a Ping.
 
 internal/model/     TaskMetaData: the JSON payload actually stored in Redis.
+
+internal/durable/   Optional Postgres journal. Records every accepted task
+                    (journal-first on enqueue) and mirrors worker lifecycles.
+                    A reconciler re-materializes into Redis any task the
+                    journal knows about that Redis is missing, healing the
+                    unavoidable double-write window. Off unless a store is
+                    attached / FORGEQUEUE_PG_DSN is set.
 
 proto/v1/           Protobuf definitions and generated Go stubs for the
                     QueueService.
@@ -338,8 +346,13 @@ configurable is future work.
   their full body.
 - Round-trip optimization: body fetched inside the claim script (3 -> 2 round
   trips per task).
+- Durable journal (Postgres, optional): enqueues are journaled before Redis
+  is written; a reconciler re-materializes into Redis any task the journal
+  knows about that Redis is missing, so a crash mid-enqueue loses nothing.
+  Lifecycle is mirrored (`processing`/`retrying`/`dead`/`succeeded`).
 - Tests for ACK/no-requeue, backoff-requeue, dead-letter and delayed-promotion
-  flows; throughput benchmarks.
+  flows; journal + reconciler tests against real Postgres; throughput
+  benchmarks.
 
 **In progress**
 
@@ -349,8 +362,6 @@ configurable is future work.
 
 **Planned**
 
-- PostgreSQL as the durable metadata store, with Redis remaining the hot
-  queue state.
 - Telemetry: throughput, latency, lease-loss counters.
 - Smarter idle polling (blocking BRPOP instead of the 1 ms poll).
 - Multi-instance deployment story; today one Redis instance is assumed.
@@ -358,7 +369,7 @@ configurable is future work.
 ## Roadmap
 
 1. Batched claims/ACKs for 2–3x throughput (the next performance lever).
-2. PostgreSQL metadata store + telemetry.
+2. Telemetry.
 3. Observability, auth/TLS, and multi-node hardening.
 
 ## Design notes

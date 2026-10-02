@@ -3,3 +3,6 @@
 
 # macos
 .DS_Store
+
+# local study notes, keep out of the public repo
+docs/

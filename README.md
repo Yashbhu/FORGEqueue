@@ -76,10 +76,16 @@ WORK     The handler runs. A background heartbeat renews the lease on a
          fixed interval.
 ACK      One atomic Lua script: verify the caller still owns the lease,
          then remove the task from the in-flight set and the leases hash.
+FAIL     On handler error the lease is released immediately (fenced) and the
+         attempt counter increments. If the retry budget remains, the task
+         is scheduled with an exponential backoff; otherwise it goes to the
+         dead-letter queue.
 ```
 
-When the lease expires without an ACK, the recovery loop moves the task back
-to the ready list for another attempt.
+Leases that expire without an ACK are picked up by the recovery loop, which
+either schedules a backoff retry or dead-letters the task once its budget is
+gone. Delayed tasks and backoff retries wait in the scheduled set; the
+promotion loop moves them to the ready list when their time comes.
 
 ## Redis state model
 
@@ -88,8 +94,9 @@ to the ready list for another attempt.
 | `queue:tasks:immediate` | List | Task IDs ready to run now |
 | `queue:tasks:inflight` | Sorted set | Task IDs, scored by lease expiry timestamp |
 | `queue:tasks:leases` | Hash | `taskID -> leaseID`, the proof of ownership |
-| `queue:tasks:scheduled` | Sorted set | Task bodies, scored by execution timestamp (used only for delayed enqueue; nothing promotes these yet) |
-| `task:<id>` | String | The JSON task body |
+| `queue:tasks:scheduled` | Sorted set | Task IDs waiting for a delay (delayed enqueue or backoff retry), scored by execution timestamp |
+| `queue:tasks:dead` | List | Failed tasks that exhausted their retry budget; the full body is stored so it can be inspected |
+| `task:<id>` | String | The JSON task body (includes the `attempts` counter) |
 
 Every state transition is a Lua script, so it happens atomically in a single
 round trip — no worker can observe a half-claimed task.
@@ -121,11 +128,17 @@ else hangs off that decision.
   results for a task it no longer owns.
 
 - **Recovery is atomic and idempotent.** Once a second, the recovery goroutine
-  scans the in-flight set for tasks whose expiry has passed, then requeues
-  them. The requeue re-verifies the expiry *inside* the Lua script against
-  Redis's own clock rather than trusting the scan, closing the race where a
-  heartbeat renews the lease between the scan and the requeue (and prevents
-  a just-heartbeat task from being double-enqueued).
+  scans the in-flight set for tasks whose expiry has passed, then hands each
+  to the shared failure script. The script re-verifies the expiry *inside*
+  Redis against its own clock rather than trusting the scan, closing the race
+  where a heartbeat renews the lease between the scan and the requeue.
+
+- **Failed tasks retry with backoff, then die quietly.** The `attempts`
+  counter travels inside the task body. Every failure (handler error or
+  crash) increments it; while the count is below `max_retries` the task is
+  scheduled to run again with an exponential backoff (`base * 2^(attempts-1)`,
+  capped); once the budget is gone, the full body is pushed to the
+  dead-letter queue. A task with `max_retries = 0` retries forever.
 
 - **At-least-once semantics.** Because recovery re-runs tasks whose lease
   expired mid-processing, handlers must be able to cope with an occasional
@@ -138,14 +151,15 @@ Honest inventory of what happens in each failure mode:
 
 | Failure | Behaviour |
 | --- | --- |
-| Worker crashes mid-handler | Lease expires, recovery requeues the task. It will run again (potentially twice). |
-| Handler returns an error | The task is not ACK'd, its lease expires, recovery requeues it. Attempts are repeated indefinitely — there is no retry cap or backoff yet, and `max_retries` is stored but not enforced. |
+| Worker crashes mid-handler | Lease expires, recovery requeues the task with backoff. It will run again (potentially twice). The crash counts as one attempt against the retry budget. |
+| Handler returns an error | Attempt counter increments and the lease is released immediately (no waiting for expiry). The task is retried with exponential backoff and dead-lettered once `max_retries` is exhausted. |
 | Stale worker tries to ACK after requeue | ACK rejected by the fencing check. |
 | Heartbeat fails (Redis unreachable or lease lost) | Task context cancelled; handler told to stop early. |
-| Task in-flight when Redis restarts | In-flight entries survive (they are just data), leases expire against real time, recovery requeues them after downtime. |
+| Task in-flight when Redis restarts | In-flight entries survive (they are just data), leases expire against real time, recovery handles them after downtime. |
 | Redis unreachable at start | Both the gateway (fail-fast Ping) and `NewWorkerPool` (Ping) refuse to start. |
-| Task body missing or corrupt JSON | Claimed, logged, skipped (`continue`) — the task remains in-flight and will be requeued forever. |
-| No handler for the task type | Claimed, logged, skipped, requeued forever on the next expiry. |
+| Task body missing | Claimed, logged, then dropped by recovery when no body is found (`no-body`). The task was never runnable. |
+| Task body is corrupt JSON | Pushed straight to the dead-letter queue so it isn't silently lost. |
+| No handler for the task type | Claimed, logged, skipped; retried on lease expiry until the retry budget is exhausted, then dead-lettered. |
 | Queue idle | Workers poll every 1 ms instead of blocking on BRPOP. Fine against local Redis, suboptimal for production; a blocking variant is planned. |
 
 Known gaps beyond those above: completed tasks' bodies (`task:<id>`) are never
@@ -228,9 +242,13 @@ throwaway database.
   to be ACK'd out of the in-flight set, then sleeps well past the lease and
   asserts recovery never re-enqueued it.
 - `TestWorkerRequeueAfterFailure` — error path. A flaky handler fails twice
-  (each failure leaving the task in-flight), recovery requeues it each time,
-  and the third attempt succeeds and ACKs. Asserts exactly three handler
-  calls and no extra runs after recovery.
+  (each failure schedules a backoff retry), and the third attempt succeeds
+  and ACKs. Asserts exactly three handler calls and no extra runs after.
+- `TestWorkerDeadLettersAfterRetryBudget` — a handler that always fails with
+  `max_retries = 2`. Asserts the task runs exactly twice, then sits in the
+  dead-letter queue with every active queue empty.
+- `TestWorkerDelayedTaskPromotion` — a task scheduled one second out is
+  promoted by the promotion loop and processed exactly once.
 
 Run them:
 
@@ -293,9 +311,12 @@ there is no config file.
 | Lease duration | `wp.leaseDuration` (unexported) | 10 s |
 | Heartbeat interval | derived | `leaseDuration / 3` |
 | Recovery interval | fixed in `recoveryLoop` | 1 s |
+| Promotion interval | fixed in `promotionLoop` | 1 s |
+| Backoff base | `wp.backoffBase` (unexported) | 1 s |
+| Backoff cap | `wp.backoffCap` (unexported) | 60 s |
 
-Making the lease duration and addresses externally configurable is future
-work.
+Making the lease duration, backoff settings and addresses externally
+configurable is future work.
 
 ## Project status
 
@@ -311,10 +332,16 @@ work.
 - Recovery: 1 s crash/expiry requeue loop, race-safe via atomic expiry
   re-check.
 - Cancellation: handlers interrupted when their lease is lost.
+- Retry budget: `attempts` counter in the body, enforced `max_retries`, and
+  exponential backoff (base * 2^n, capped).
+- Delayed tasks: the promotion loop runs delayed enqueues and backoff retries
+  out of the scheduled set.
+- Dead-letter queue: tasks that exhaust their retry budget land here with
+  their full body.
 - Round-trip optimization: body fetched inside the claim script (3 -> 2 round
   trips per task).
-- Tests for ACK/no-requeue and flush-fail-requeue flows; throughput
-  benchmarks.
+- Tests for ACK/no-requeue, backoff-requeue, dead-letter and delayed-promotion
+  flows; throughput benchmarks.
 
 **In progress**
 
@@ -324,10 +351,6 @@ work.
 
 **Planned**
 
-- Retry budget: enforce `max_retries` with exponential backoff.
-- Delayed-task promotion: move due tasks out of `queue:tasks:scheduled` into
-  the ready list (enqueueing delayed tasks works; nothing runs them yet).
-- Dead-letter queue for tasks that exhaust their retry budget.
 - PostgreSQL as the durable metadata store, with Redis remaining the hot
   queue state.
 - Telemetry: throughput, latency, lease-loss counters.
@@ -336,12 +359,9 @@ work.
 
 ## Roadmap
 
-1. Retry budget + backoff, then DLQ. Until these exist, an erroring handler
-   causes infinite requeue.
-2. Delayed-task promotion, to make `delay_seconds` actually work.
-3. Batched claims/ACKs for 2–3x throughput.
-4. PostgreSQL metadata store + telemetry.
-5. Observability, auth/TLS, and multi-node hardening.
+1. Batched claims/ACKs for 2–3x throughput (the next performance lever).
+2. PostgreSQL metadata store + telemetry.
+3. Observability, auth/TLS, and multi-node hardening.
 
 ## Design notes
 
@@ -356,8 +376,12 @@ fencing and recovery checks are atomic with the writes — and speed:
   with new expiry from Redis's own clock.
 - **ACK** (1 round trip): HGET lease -> verify token -> ZREM in-flight -> HDEL
   lease.
-- **Requeue** (1 round trip per expired task): ZSCORE -> compare against
-  Redis `TIME` -> ZREM -> HDEL -> LPUSH.
+- **Requeue / dead-letter** (1 round trip per task): release the lease (fence
+  or expiry re-check) -> load the body -> increment `attempts` -> either ZADD a
+  backoff into the scheduled set or LPUSH the exhausted body to the dead
+  queue.
+- **Promote** (1 round trip per task): ZSCORE a scheduled task -> compare
+  against Redis `TIME` -> ZREM -> LPUSH to the ready queue.
 
 The remaining cost is transmission, not atomicity: two round trips per
 completed task. Batching by claiming N tasks per script call is the intended

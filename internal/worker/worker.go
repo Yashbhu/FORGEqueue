@@ -40,6 +40,14 @@ type WorkerPool struct {
 	handlers map[string]TaskHandler
 	// time to wait for a lease before giving up on a task.
 	leaseDuration time.Duration
+
+	// starting delay before the first retry after a failure.
+	// every retry doubles it (1s, 2s, 4s, ...) until backoffCap.
+	backoffBase time.Duration
+
+	// ceiling for the exponential backoff delay so a flaky task
+	// can't schedule itself minutes into the future.
+	backoffCap time.Duration
 }
 
 // TaskLease is the proof of ownership a worker holds over a claimed task.
@@ -101,6 +109,8 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		cancel:        cancel,
 		handlers:      make(map[string]TaskHandler),
 		leaseDuration: 10 * time.Second,
+		backoffBase:   1 * time.Second,
+		backoffCap:    60 * time.Second,
 	}, nil
 }
 
@@ -214,6 +224,27 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 					task.ID,
 					err,
 				)
+
+				// A handler error counts as a failed attempt. Release the
+				// lease right away (fenced, like an ACK) instead of waiting
+				// for it to expire, so the retry happens on the backoff
+				// delay instead of whenever the lease runs out.
+				retry, rerr := wp.requeueOrDead(task.ID, lease.LeaseID)
+				if rerr != nil {
+					log.Printf(
+						"worker %d: failed to schedule retry for task %s: %v",
+						workerID,
+						task.ID,
+						rerr,
+					)
+					continue
+				}
+				log.Printf(
+					"worker %d: task %s after failure: %s",
+					workerID,
+					task.ID,
+					retry,
+				)
 				continue
 			}
 			// get acknowledgement for the task
@@ -261,6 +292,14 @@ func (wp *WorkerPool) Start() {
 	go func() {
 		defer wp.wg.Done()
 		wp.recoveryLoop()
+	}()
+
+	// The promotion loop is separate too: it watches the scheduled set and
+	// moves tasks whose delay has passed into the ready queue.
+	wp.wg.Add(1)
+	go func() {
+		defer wp.wg.Done()
+		wp.promotionLoop()
 	}()
 }
 
@@ -396,62 +435,137 @@ func (wp *WorkerPool) findExpiredTasks() ([]string, error) {
 	).Result()
 }
 
-// removeExpiredTasks returns expired tasks to the immediate queue.
+// requeueOrDead decides what happens to a failed or expired task.
 //
-// findExpiredTasks() only produces candidates: the scan can go stale, since
-// a heartbeat may renew the lease between the scan and this call. So this
-// function re-checks the expiry inside Redis, atomically, right before
-// requeueing. If the task is no longer expired, it's left alone.
+// Two different callers share this one script:
+//
+//   - the worker, right after a handler returns an error. It passes the
+//     leaseID so the script fences like an ACK: if the worker no longer owns
+//     the task, the call is rejected and the task is left alone.
+//   - the recovery loop, for a task whose lease expired while nobody was
+//     processing it. It passes "" and instead relies on re-checking the
+//     inflight score against Redis's own clock, exactly like the old
+//     removeExpiredTasks did.
+//
+// Whichever caller it is, the script then:
+//
+//  1. loads the task body, and increments the "attempts" counter.
+//  2. decides between two outcomes:
+//     - "scheduled": still below its retry budget. The body is rewritten
+//     with the new attempt count and the task goes into the scheduled set
+//     with a backoff score (now + base * 2^(attempts-1), capped).
+//     - "dead": the budget is exhausted. The full body (with attempts) is
+//     pushed onto the dead-letter queue so a human can inspect it.
+//
+// A task with max_retries = 0 has an unlimited budget and always retries.
+//
+// Return values: "fenced" (worker lost the lease), "gone" (nothing in
+// inflight), "renewed" (lease extended before us), "no-body" (dropped),
+// "dead" (moved to the dead-letter queue), "scheduled" (retry queued).
 //
 // KEYS[1] -> queue:tasks:inflight
-// KEYS[2] -> queue:tasks:immediate
-// KEYS[3] -> queue:tasks:leases
-// ARGV[1] -> the task ID to requeue
-func (wp *WorkerPool) removeExpiredTasks(taskIDs []string) error {
+// KEYS[2] -> queue:tasks:leases
+// KEYS[3] -> queue:tasks:scheduled
+// KEYS[4] -> queue:tasks:dead
+// ARGV[1] -> "task:" prefix (builds the body key)
+// ARGV[2] -> taskID
+// ARGV[3] -> leaseID to fence with, or "" when called from recovery
+// ARGV[4] -> backoff base in seconds
+// ARGV[5] -> backoff cap in seconds
+func (wp *WorkerPool) requeueOrDead(taskID string, leaseID string) (string, error) {
 	script := redis.NewScript(`
-        local expiry = redis.call("ZSCORE", KEYS[1], ARGV[1])
-
-        if not expiry then
-            return 0
+        if ARGV[3] ~= "" then
+            -- called by the worker: fence like an ACK.
+            local current = redis.call("HGET", KEYS[2], ARGV[2])
+            if current ~= ARGV[3] then
+                return "fenced"
+            end
+            redis.call("ZREM", KEYS[1], ARGV[2])
+            redis.call("HDEL", KEYS[2], ARGV[2])
+        else
+            -- called by recovery: re-check the expiry inside Redis.
+            local expiry = redis.call("ZSCORE", KEYS[1], ARGV[2])
+            if not expiry then
+                return "gone"
+            end
+            local now = redis.call("TIME")[1]
+            if tonumber(expiry) > tonumber(now) then
+                return "renewed"
+            end
+            redis.call("ZREM", KEYS[1], ARGV[2])
+            redis.call("HDEL", KEYS[2], ARGV[2])
         end
 
-        local now = redis.call("TIME")[1]
-
-        if tonumber(expiry) > tonumber(now) then
-            return 0
+        local body = redis.call("GET", ARGV[1] .. ARGV[2])
+        if not body then
+            return "no-body"
         end
 
-        redis.call("ZREM", KEYS[1], ARGV[1])
-        redis.call("HDEL", KEYS[3], ARGV[1])
-        redis.call("LPUSH", KEYS[2], ARGV[1])
+        local ok, task = pcall(cjson.decode, body)
+        -- Un-decodable bodies can't be retried or counted, so they go
+        -- straight to the dead-letter queue instead of vanishing.
+        if not ok or type(task) ~= "table" then
+            redis.call("LPUSH", KEYS[4], body)
+            return "dead"
+        end
 
-        return 1
+        local attempts = (task.attempts or 0) + 1
+        task.attempts = attempts
+
+        local maxRetries = task.max_retries or 0
+        if maxRetries > 0 and attempts >= maxRetries then
+            redis.call("LPUSH", KEYS[4], cjson.encode(task))
+            return "dead"
+        end
+
+        -- backoff delay: base * 2^(attempts-1), capped.
+        local base = tonumber(ARGV[4])
+        local cap = tonumber(ARGV[5])
+        local delay = base
+        local i = 2
+        while i <= attempts do
+            delay = delay * 2
+            i = i + 1
+        end
+        if delay > cap then
+            delay = cap
+        end
+
+        local retryAt = redis.call("TIME")[1] + delay
+
+        redis.call("SET", ARGV[1] .. ARGV[2], cjson.encode(task))
+        redis.call("ZADD", KEYS[3], retryAt, ARGV[2])
+        return "scheduled"
     `)
-	// Requeue each expired task, one Lua call at a time.
-	for _, taskID := range taskIDs {
-		_, err := script.Run(
-			wp.ctx,
-			wp.redisClient,
-			[]string{
-				"queue:tasks:inflight",
-				"queue:tasks:immediate",
-				"queue:tasks:leases",
-			},
-			taskID,
-		).Result()
 
-		if err != nil {
-			return err
-		}
+	result, err := script.Run(
+		wp.ctx,
+		wp.redisClient,
+		[]string{
+			"queue:tasks:inflight",
+			"queue:tasks:leases",
+			"queue:tasks:scheduled",
+			"queue:tasks:dead",
+		},
+		"task:",
+		taskID,
+		leaseID,
+		int64(wp.backoffBase/time.Second),
+		int64(wp.backoffCap/time.Second),
+	).Result()
+
+	if err != nil {
+		return "", err
 	}
-	return nil
+	return result.(string), nil
 }
 
-// recoveryLoop watches for expired leases and requeues them.
+// recoveryLoop watches for expired leases and handles them.
 //
-// Every second it asks Redis which in-flight tasks have expired and moves
-// those back to the immediate queue for another attempt. It runs in its
-// own goroutine and stops when the pool shuts down.
+// Every second it asks Redis which in-flight tasks have expired, then hands
+// each one to requeueOrDead, which either schedules a backoff retry or dead-
+// letters it once the retry budget is gone. It runs in its own goroutine and
+// stops when the pool shuts down.
 func (wp *WorkerPool) recoveryLoop() {
 	// Re-check for expired tasks once per second.
 	ticker := time.NewTicker(1 * time.Second)
@@ -466,12 +580,107 @@ func (wp *WorkerPool) recoveryLoop() {
 				continue
 			}
 
-			if len(taskIDs) == 0 {
-				continue
+			for _, taskID := range taskIDs {
+				status, err := wp.requeueOrDead(taskID, "")
+				if err != nil {
+					log.Printf("recovery: failed to handle task %s: %v", taskID, err)
+					continue
+				}
+				switch status {
+				case "dead":
+					log.Printf("recovery: task %s exhausted its retry budget, moved to dead-letter queue", taskID)
+				case "no-body":
+					log.Printf("recovery: task %s has no body, dropped", taskID)
+				}
+				// "renewed", "gone" and "scheduled" are the quiet cases:
+				// the lease was extended, someone else handled it, or it
+				// was scheduled for another attempt.
 			}
 
-			if err := wp.removeExpiredTasks(taskIDs); err != nil {
-				log.Printf("recovery: failed to requeue expired tasks: %v", err)
+		case <-wp.quit:
+			return
+		}
+	}
+}
+
+// findDueTasks returns task IDs in the scheduled set whose delay has passed.
+//
+// Being "due" as reported here is only a candidate: promoteTask re-checks the
+// score against Redis's own clock atomically, just like recovery does.
+func (wp *WorkerPool) findDueTasks() ([]string, error) {
+	now := time.Now().Unix()
+	return wp.redisClient.ZRangeArgs(
+		wp.ctx,
+		redis.ZRangeArgs{
+			Key:     "queue:tasks:scheduled",
+			Start:   "-inf",
+			Stop:    strconv.FormatInt(now, 10),
+			ByScore: true,
+		},
+	).Result()
+}
+
+// promoteTask moves one task from the scheduled set to the immediate queue.
+//
+// The task body lives at task:<id> (both the gateway's delayed path and
+// requeueOrDead write it there), so promotion is just a list move. The score
+// is re-checked against TIME inside the script so a task is never promoted
+// early and never promoted twice.
+//
+// KEYS[1] -> queue:tasks:scheduled
+// KEYS[2] -> queue:tasks:immediate
+// ARGV[1] -> taskID
+func (wp *WorkerPool) promoteTask(taskID string) (bool, error) {
+	script := redis.NewScript(`
+        local score = redis.call("ZSCORE", KEYS[1], ARGV[1])
+        if not score then
+            return 0
+        end
+        local now = redis.call("TIME")[1]
+        if tonumber(score) > tonumber(now) then
+            return 0
+        end
+        redis.call("ZREM", KEYS[1], ARGV[1])
+        redis.call("LPUSH", KEYS[2], ARGV[1])
+        return 1
+    `)
+
+	result, err := script.Run(
+		wp.ctx,
+		wp.redisClient,
+		[]string{
+			"queue:tasks:scheduled",
+			"queue:tasks:immediate",
+		},
+		taskID,
+	).Result()
+
+	if err != nil {
+		return false, err
+	}
+	return result.(int64) == 1, nil
+}
+
+// promotionLoop watches the scheduled set and moves due tasks to the ready
+// queue. Delayed enqueues and backoff retries both land here. It runs in its
+// own goroutine and stops when the pool shuts down.
+func (wp *WorkerPool) promotionLoop() {
+	// Check for due tasks once per second.
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			taskIDs, err := wp.findDueTasks()
+			if err != nil {
+				log.Printf("promotion: failed to find due tasks: %v", err)
+				continue
+			}
+			for _, taskID := range taskIDs {
+				if _, err := wp.promoteTask(taskID); err != nil {
+					log.Printf("promotion: failed to promote task %s: %v", taskID, err)
+				}
 			}
 
 		case <-wp.quit:

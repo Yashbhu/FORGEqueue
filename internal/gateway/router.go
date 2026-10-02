@@ -57,12 +57,27 @@ func (tr *TaskRouter) RouteTask(
 	// checking if delay seconds is greater than 0 if so we schedule the task to be executed at a later time
 	if delaySeconds > 0 {
 		targetTime := time.Now().Unix() + delaySeconds
-		err := tr.redisClient.ZAdd(
+
+		// Write the body first so it is already in place when the worker's
+		// promotion loop moves the ID out of the scheduled set. The scheduled
+		// set only stores the task ID, matching the immediate path: the body
+		// always lives at task:<id>, no matter which path enqueued it.
+		err := tr.redisClient.Set(
+			ctx,
+			"task:"+id,
+			serializedData,
+			0,
+		).Err()
+		if err != nil {
+			return err
+		}
+
+		err = tr.redisClient.ZAdd(
 			ctx,
 			"queue:tasks:scheduled",
 			redis.Z{
 				Score:  float64(targetTime),
-				Member: serializedData,
+				Member: id,
 			},
 		).Err()
 		if err != nil {

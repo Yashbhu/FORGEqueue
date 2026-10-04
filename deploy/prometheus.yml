@@ -1,0 +1,32 @@
+# Prometheus scrape config for ForgeQueue.
+#
+# The gateway and the worker expose separate /metrics endpoints and mostly
+# disjoint metric sets, so they are separate jobs rather than one job with
+# different ports. That keeps "accepted" and "executed" distinguishable in
+# PromQL instead of blended into one series.
+#
+# Run it against a local process tree:
+#   prometheus --config.file=deploy/prometheus.yml
+#
+# Both targets are optional. If a process is not running the job goes
+# red, which is the correct signal: it means that half of the pipeline
+# is not reporting, not that the queue is idle.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: forgequeue-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          component: gateway
+
+  - job_name: forgequeue-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:9091"]
+        labels:
+          component: worker

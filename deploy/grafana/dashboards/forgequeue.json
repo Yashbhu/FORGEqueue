@@ -1,0 +1,505 @@
+{
+  "uid": "forgequeue-overview",
+  "title": "ForgeQueue Overview",
+  "description": "Queue depth, throughput and latency. Assumes deploy/prometheus.yml.",
+  "tags": [
+    "forgequeue"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Enqueued (gateway)",
+      "description": "Tasks the API accepted. Compare against processed to spot a stalled worker.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_tasks_enqueued_total{job=\"forgequeue-gateway\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Processed (worker)",
+      "description": "Tasks actually ACKed, counted from the ACK script return value, so a fenced task is not counted.",
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_tasks_processed_total{job=\"forgequeue-worker\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Retried",
+      "description": "Handler failures. Sustained retries mean a handler is broken, not slow.",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_tasks_retried_total",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Dead-lettered",
+      "description": "Tasks that exhausted their retry budget.",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_tasks_dead_lettered_total",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Queue depth by state",
+      "description": "Sampled from Redis every 5s rather than read per scrape, so scraping is O(1) in Redis.",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_queue_ready{job=\"forgequeue-gateway\"}",
+          "legendFormat": "ready",
+          "refId": "ready"
+        },
+        {
+          "expr": "forgequeue_queue_inflight{job=\"forgequeue-gateway\"}",
+          "legendFormat": "in-flight",
+          "refId": "in-flight"
+        },
+        {
+          "expr": "forgequeue_queue_scheduled{job=\"forgequeue-gateway\"}",
+          "legendFormat": "scheduled (delayed)",
+          "refId": "scheduled (delayed)"
+        },
+        {
+          "expr": "forgequeue_queue_dead{job=\"forgequeue-gateway\"}",
+          "legendFormat": "dead",
+          "refId": "dead"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "In-flight vs ready",
+      "description": "Inflight above zero with ready at zero means tasks are claimed but not finishing: look for a wedged handler.",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "forgequeue_queue_inflight{job=\"forgequeue-gateway\"}",
+          "legendFormat": "in-flight",
+          "refId": "in-flight"
+        },
+        {
+          "expr": "forgequeue_queue_ready{job=\"forgequeue-gateway\"}",
+          "legendFormat": "ready",
+          "refId": "ready"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Handler duration p50/p95/p99",
+      "description": "How long handlers actually run, independent of queue wait.",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(forgequeue_task_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(forgequeue_task_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(forgequeue_task_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "p99"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Redis round trips p95",
+      "description": "Batching exists to collapse these. A heartbeat p95 of zero means renewal is not running.",
+      "gridPos": {
+        "x": 8,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(forgequeue_redis_claim_seconds_bucket[1m])) by (le))",
+          "legendFormat": "claim p95",
+          "refId": "claim p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(forgequeue_redis_ack_seconds_bucket[1m])) by (le))",
+          "legendFormat": "ack p95",
+          "refId": "ack p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(forgequeue_redis_heartbeat_seconds_bucket[1m])) by (le))",
+          "legendFormat": "heartbeat p95",
+          "refId": "heartbeat p95"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Lease losses",
+      "description": "A heartbeat saw a rejected lease: two workers believed they owned the same task.",
+      "gridPos": {
+        "x": 16,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(forgequeue_lease_losses_total[1m])",
+          "legendFormat": "per second",
+          "refId": "per second"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Throughput",
+      "description": "The gap between the two lines is the queue depth. A widening gap means the worker cannot keep up.",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "forgequeue"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(forgequeue_tasks_enqueued_total{job=\"forgequeue-gateway\"}[1m])",
+          "legendFormat": "enqueued/s",
+          "refId": "enqueued/s"
+        },
+        {
+          "expr": "rate(forgequeue_tasks_processed_total{job=\"forgequeue-worker\"}[1m])",
+          "legendFormat": "processed/s",
+          "refId": "processed/s"
+        }
+      ]
+    }
+  ]
+}

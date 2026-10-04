@@ -1,0 +1,17 @@
+# Grafana datasource provisioning. Loaded automatically by Grafana at startup,
+# so the dashboard does not have to be wired up by hand after import.
+apiVersion: 1
+
+# Prometheus is on 9095 because 9090 is the gateway metrics port.
+# Must match deploy/observability.sh.
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: forgequeue
+    access: proxy
+    url: http://localhost:9095
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 5s

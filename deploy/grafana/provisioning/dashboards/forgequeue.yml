@@ -1,0 +1,18 @@
+# Tells Grafana to load every dashboard JSON in ../../dashboards.
+#
+# The path is interpolated from the environment rather than hardcoded, so
+# the repo stays cloneable anywhere. deploy/observability.sh exports
+# FORGEQUEUE_DASHBOARDS_DIR to the absolute path before starting Grafana.
+apiVersion: 1
+
+providers:
+  - name: forgequeue
+    orgId: 1
+    folder: ForgeQueue
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: ${FORGEQUEUE_DASHBOARDS_DIR}
+      foldersFromFilesStructure: false

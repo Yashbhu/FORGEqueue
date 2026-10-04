@@ -16,6 +16,7 @@ import (
 
 	// Absolute structural paths using your go.mod module name:
 	"forgequeue/internal/durable"
+	"forgequeue/internal/metrics"
 	queuev1 "forgequeue/proto/v1"
 )
 
@@ -63,6 +64,27 @@ func (s *server) EnqueueTask(
 func Start() {
 	// Initialize your custom Redis connection pool pointer
 	redisAddress := "localhost:6379"
+
+	// Telemetry is opt-in: build it only when a scrape address is
+	// configured, otherwise the router and worker keep no-op instruments
+	// and nothing is exported. FORGEQUEUE_METRICS_ADDR is the scrape
+	// endpoint (the Prometheus default is :9090).
+	metricsAddr := os.Getenv("FORGEQUEUE_METRICS_ADDR")
+
+	var (
+		telemetry  *metrics.Metrics
+		metricsSrv *metrics.Server
+	)
+
+	if metricsAddr != "" {
+		m, err := metrics.New()
+		if err != nil {
+			log.Fatalf("failed to init telemetry: %v", err)
+		}
+		telemetry = m
+		metricsSrv = metrics.NewServer(metricsAddr, m)
+	}
+
 	//wait for 3 seconds to boot up otherwise cancel
 	// 3 seconds gaurd creating a boot context and checking if the task router is ready
 	bootctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -73,6 +95,7 @@ func Start() {
 	if err != nil {
 		log.Fatalf("failed to create task router: %v", err)
 	}
+	taskRouter.WithMetrics(telemetry)
 
 	// The durable journal is optional and opt-in: set FORGEQUEUE_PG_DSN and
 	// every enqueue is journaled to Postgres first (survives crashes, heals
@@ -107,6 +130,27 @@ func Start() {
 
 	log.Println("gateway network online on port :50051")
 
+	// Bring the scrape endpoint up alongside the gRPC listener. Prometheus
+	// then has something to poll for queue counters and latencies.
+	if metricsSrv != nil {
+		if err := metricsSrv.Start(); err != nil {
+			log.Fatalf("failed to start metrics server: %v", err)
+		}
+		log.Printf("metrics endpoint online on %s/metrics", metricsAddr)
+
+		// The gateway reports queue depth too, not just enqueues. Without
+		// this the depth gauges stay absent until a worker happens to
+		// publish, and an idle gateway would scrape as an empty endpoint.
+		go metrics.NewDepthSampler(
+			telemetry,
+			taskRouter.redisClient,
+			metrics.DefaultDepthInterval,
+			func(err error) {
+				log.Printf("queue depth sample failed: %v", err)
+			},
+		).Run(context.Background())
+	}
+
 	//Run the infinite network event execution loop
 	// create an anonymous goroutine to serve the gRPC server
 	go func() {
@@ -123,6 +167,20 @@ func Start() {
 	sh := <-shutdownChan
 	log.Printf("received shutdown signal: %v", sh)
 	grpcServer.GracefulStop()
+
+	// Stop the scrape endpoint and flush buffered metrics before exiting,
+	// so a scrape right before shutdown still sees the final counts.
+	if metricsSrv != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stopCancel()
+		if err := metricsSrv.Stop(stopCtx); err != nil {
+			log.Printf("metrics server shutdown: %v", err)
+		}
+		if err := telemetry.Shutdown(stopCtx); err != nil {
+			log.Printf("telemetry shutdown: %v", err)
+		}
+	}
+
 	//graceful shutdown
 	log.Println("gateway network offline")
 

@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"forgequeue/internal/durable"
+	"forgequeue/internal/metrics"
 	"forgequeue/internal/model"
 )
 
@@ -59,6 +60,10 @@ type WorkerPool struct {
 	// state can be rebuilt after a crash. Nop by default: without a store
 	// the pool behaves exactly as it always did.
 	store durable.Store
+
+	// Observability. Never nil: the default pool gets no-op instruments so
+	// instrumentation call sites stay free of nil checks.
+	metrics *metrics.Metrics
 }
 
 // TaskLease is the proof of ownership a worker holds over a claimed task.
@@ -124,7 +129,19 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		backoffBase:   1 * time.Second,
 		backoffCap:    60 * time.Second,
 		batchSize:     1,
+		metrics:       metrics.NewNop(),
 	}, nil
+}
+
+// WithMetrics attaches a telemetry sink to the pool. Call it before Start().
+// Passing nil is a no-op, so callers can forward an optional *metrics.Metrics
+// without branching.
+func (wp *WorkerPool) WithMetrics(m *metrics.Metrics) *WorkerPool {
+	if m == nil {
+		return wp
+	}
+	wp.metrics = m
+	return wp
 }
 
 // workerLoop is the work performed by one worker.
@@ -161,12 +178,11 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				continue
 			}
 
-			// Successfully handled tasks are ACKed together at the end of
-			// the batch, so their finishes only cost one round trip.
 			var ackIDs []string
 			var ackLeases []string
 
 			for _, claim := range claims {
+
 				// Defensive guard: a claimed task must always have an ID.
 				if claim.TaskID == "" {
 					time.Sleep(100 * time.Millisecond)
@@ -226,6 +242,7 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 					)
 				}
 
+				handlerStart := time.Now()
 				// This task's own cancellation signal. If the lease is lost
 				// mid-execution, this context can be cancelled so the handler
 				// has a chance to stop early. Canceled explicitly (not via
@@ -252,6 +269,14 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				// so renewing the lease would only delay recovery.
 				stopHeartbeat()
 				cancelTask()
+
+				// How long the handler actually ran. Recorded for both
+				// outcomes: a slow success and a slow failure are very
+				// different signals when you are looking at p99.
+				wp.metrics.TaskDuration.Record(
+					wp.ctx,
+					time.Since(handlerStart).Seconds(),
+				)
 
 				if handlerErr == nil {
 					ackIDs = append(ackIDs, claim.TaskID)
@@ -288,8 +313,10 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				)
 				switch status {
 				case "scheduled":
+					wp.metrics.TasksRetried.Add(wp.ctx, 1)
 					wp.reportRetry(task.ID)
 				case "dead":
+					wp.metrics.TasksDLQ.Add(wp.ctx, 1)
 					wp.reportDead(task.ID)
 				}
 			}
@@ -299,15 +326,38 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 			}
 
 			// ACK every successful task of the batch in one fenced script.
-			if _, err := wp.ackBatch(ackIDs, ackLeases); err != nil {
+			//
+			// The script fences per task, so a batch can be partially ACKed: if
+			// one task's lease expired while the batch was being handled,
+			// recovery may already have handed that task to another worker and
+			// rotated its lease. That task is skipped, the rest are ACKed, and
+			// the returned count is what actually completed.
+			acked, ackErr := wp.ackBatch(ackIDs, ackLeases)
+			if ackErr != nil {
 				log.Printf(
 					"worker %d: failed to ACK %d task(s): %v",
 					workerID,
 					len(ackIDs),
-					err,
+					ackErr,
 				)
 				continue
 			}
+
+			if acked < int64(len(ackIDs)) {
+				// Worth a warning: this is the at-least-once duplicate path. A
+				// silent overcount here would look like healthy throughput while
+				// tasks were actually running twice.
+				log.Printf(
+					"worker %d: only %d of %d task(s) ACKed, %d lost their lease "+
+						"and may run again elsewhere",
+					workerID, acked, len(ackIDs), len(ackIDs)-int(acked),
+				)
+			}
+
+			// ACKed means done. Counted from the script's return value rather
+			// than len(ackIDs), so a fenced task is not reported as processed
+			// while it is still outstanding elsewhere.
+			wp.metrics.TasksProcessed.Add(wp.ctx, acked)
 
 			// ACKed means done: record it so the journal stops tracking it.
 			for _, id := range ackIDs {
@@ -394,6 +444,24 @@ func (wp *WorkerPool) Start() {
 			durable.ReconcileLoop(wp.ctx, wp.redisClient, wp.store)
 		}()
 	}
+
+	// Queue depth is sampled from Redis on a timer. Doing it in-process
+	// would need a matching increment and decrement for every transition,
+	// and one missed transition would leave the gauge permanently wrong.
+	if wp.metrics.Ready {
+		wp.wg.Add(1)
+		go func() {
+			defer wp.wg.Done()
+			metrics.NewDepthSampler(
+				wp.metrics,
+				wp.redisClient,
+				metrics.DefaultDepthInterval,
+				func(err error) {
+					log.Printf("queue depth sample failed: %v", err)
+				},
+			).Run(wp.ctx)
+		}()
+	}
 }
 
 // Stop gracefully shuts down the worker pool.
@@ -446,6 +514,8 @@ type TaskHandler interface {
 // them to whatever it pops (ARGV[3+i] goes to the i-th popped task), and the
 // caller pairs the returned bodies back to those IDs by index.
 func (wp *WorkerPool) claimBatch() ([]TaskClaim, error) {
+	claimStart := time.Now()
+
 	// The expiry is the deadline for the lease. If the worker doesn't
 	// ACK or heartbeat before this, recovery will requeue the task.
 	leaseExpiry := time.Now().Add(wp.leaseDuration).Unix()
@@ -514,8 +584,21 @@ func (wp *WorkerPool) claimBatch() ([]TaskClaim, error) {
 
 	// The script returns an empty string when the queue was empty.
 	if result == "" {
+		// Deliberately not recorded. An idle worker polls this script every
+		// millisecond, so those round trips outnumber real claims by orders
+		// of magnitude and complete in microseconds. Averaging them into the
+		// same histogram drags every percentile toward zero and hides the
+		// claim latency that actually matters. The poll rate is still
+		// visible as Redis command traffic in Prometheus.
 		return nil, nil
 	}
+
+	// A claim that returned work is worth timing: it is the queue's floor on
+	// per-task overhead.
+	wp.metrics.ClaimLatency.Record(
+		wp.ctx,
+		time.Since(claimStart).Seconds(),
+	)
 
 	// Otherwise it returns {id1, body1, id2, body2, ...}.
 	values := result.([]interface{})
@@ -781,9 +864,11 @@ func (wp *WorkerPool) recoveryLoop() {
 				}
 				switch status {
 				case "scheduled":
+					wp.metrics.TasksRetried.Add(wp.ctx, 1)
 					wp.reportRetry(taskID)
 				case "dead":
 					log.Printf("recovery: task %s exhausted its retry budget, moved to dead-letter queue", taskID)
+					wp.metrics.TasksDLQ.Add(wp.ctx, 1)
 					wp.reportDead(taskID)
 				case "no-body":
 					log.Printf("recovery: task %s has no body, dropped", taskID)
@@ -919,6 +1004,7 @@ func (wp *WorkerPool) ackBatch(taskIDs []string, leaseIDs []string) (int64, erro
         return acked
     `)
 
+	ackStart := time.Now()
 	result, err := script.Run(
 		wp.ctx,
 		wp.redisClient,
@@ -929,12 +1015,24 @@ func (wp *WorkerPool) ackBatch(taskIDs []string, leaseIDs []string) (int64, erro
 		args...,
 	).Result()
 
+	wp.metrics.ACKLatency.Record(
+		wp.ctx,
+		time.Since(ackStart).Seconds(),
+	)
+
 	if err != nil {
 		return 0, err
 	}
 
 	return result.(int64), nil
 }
+
+// errLeaseLost is returned by heartbeat when Redis answered but the lease
+// token no longer matches. A distinct sentinel (rather than a generic
+// error) so the caller can tell "somebody else owns this task now" apart
+// from "Redis was unreachable", which is a transport problem rather than a
+// lost lease and should not be counted as one.
+var errLeaseLost = errors.New("heartbeat rejected: lease no longer held")
 
 // heartbeat renews the lease for a task that is still being processed.
 //
@@ -948,6 +1046,7 @@ func (wp *WorkerPool) ackBatch(taskIDs []string, leaseIDs []string) (int64, erro
 // ARGV[2] -> leaseID presented by the worker
 // ARGV[3] -> lease duration in seconds
 func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
+	beatStart := time.Now()
 	script := redis.NewScript(`
         local currentLease = redis.call("HGET", KEYS[1], ARGV[1])
 
@@ -974,6 +1073,13 @@ func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
 		int64(wp.leaseDuration/time.Second),
 	).Result()
 
+	// Recorded on both paths: a slow heartbeat is what causes lease
+	// expiry in the first place, so the failures matter too.
+	wp.metrics.HeartbeatLatency.Record(
+		wp.ctx,
+		time.Since(beatStart).Seconds(),
+	)
+
 	if err != nil {
 		return err
 	}
@@ -981,7 +1087,7 @@ func (wp *WorkerPool) heartbeat(taskID string, leaseID string) error {
 	// return 0 means the worker no longer holds the lease,
 	// so the heartbeat is rejected.
 	if result.(int64) == 0 {
-		return errors.New("heartbeat rejected: lease no longer held")
+		return errLeaseLost
 	}
 
 	return nil
@@ -1015,6 +1121,14 @@ func (wp *WorkerPool) heartbeatLoop(
 					taskID,
 					err,
 				)
+
+				// Only a rejected lease counts as a lease loss. A
+				// transport error or a shutdown-induced cancellation
+				// is a different failure and would otherwise inflate
+				// the metric during a Redis blip or a rolling restart.
+				if errors.Is(err, errLeaseLost) {
+					wp.metrics.LeaseLosses.Add(wp.ctx, 1)
+				}
 
 				cancelTask()
 				return

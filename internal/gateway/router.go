@@ -8,6 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"forgequeue/internal/durable"
+	"forgequeue/internal/metrics"
 	"forgequeue/internal/model"
 	"forgequeue/internal/redisutil"
 )
@@ -20,6 +21,9 @@ type TaskRouter struct {
 	// Redis is touched, so a crash mid-enqueue never loses the task - the
 	// reconciler finishes the write. Nop by default (no database configured).
 	store durable.Store
+	// Observability. Never nil: the default router gets no-op instruments so
+	// instrumentation call sites stay free of nil checks.
+	metrics *metrics.Metrics
 }
 
 // constructor function which returns a pointer to struct
@@ -35,6 +39,7 @@ func NewTaskRouter(ctx context.Context, addr string) (*TaskRouter, error) {
 	return &TaskRouter{ // returns a pointer to a new TaskRouter struct with the redis client assigned to the redisClient field
 		redisClient: client,
 		store:       durable.Nop{},
+		metrics:     metrics.NewNop(),
 	}, nil
 }
 
@@ -43,6 +48,16 @@ func NewTaskRouter(ctx context.Context, addr string) (*TaskRouter, error) {
 // afterwards; a crash in between is repaired by the reconciler.
 func (tr *TaskRouter) WithStore(s durable.Store) *TaskRouter {
 	tr.store = s
+	return tr
+}
+
+// WithMetrics attaches a telemetry sink to the router. Call it before
+// serving requests. Passing nil is a no-op.
+func (tr *TaskRouter) WithMetrics(m *metrics.Metrics) *TaskRouter {
+	if m == nil {
+		return tr
+	}
+	tr.metrics = m
 	return tr
 }
 
@@ -114,7 +129,16 @@ func (tr *TaskRouter) RouteTask(
 
 		// Redis now provably holds the task; the journal can stop treating
 		// it as pending.
-		return tr.store.Materialized(ctx, id)
+		if err := tr.store.Materialized(ctx, id); err != nil {
+			return err
+		}
+
+		// Counted only after Redis accepted the task, so the metric
+		// reflects work the queue will actually run. Queue depth is not
+		// adjusted here: the depth gauges are sampled from Redis, which
+		// already counted this push.
+		tr.metrics.TasksEnqueued.Add(ctx, 1)
+		return nil
 	}
 
 	// immediate enqueue.
@@ -148,5 +172,10 @@ func (tr *TaskRouter) RouteTask(
 		return err
 	}
 
-	return tr.store.Materialized(ctx, id)
+	if err := tr.store.Materialized(ctx, id); err != nil {
+		return err
+	}
+
+	tr.metrics.TasksEnqueued.Add(ctx, 1)
+	return nil
 }

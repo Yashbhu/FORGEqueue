@@ -1,14 +1,26 @@
 # ForgeQueue
 
-ForgeQueue is a Redis-backed task queue written in Go. It implements durable, at-least-once task execution with leases, heartbeats, crash recovery, and ownership fencing from first principles. 
+ForgeQueue is a Redis-backed task queue written in Go. It implements durable,
+at-least-once task execution with leases, heartbeats, crash recovery, and
+ownership fencing from first principles.
+
+> **What this is.** A learning / portfolio project that implements a task queue
+> the way a real one works: atomic Lua state transitions, lease ownership,
+> heartbeats, recovery, retries and a dead-letter queue. It is deliberately
+> small and readable rather than production-hardened. It is **not** a drop-in
+> replacement for Redis-backed job systems like Asynq, Celery, BullMQ or
+> Sidekiq — see [Limitations](#limitations) for the honest list of what it does
+> not do.
 
 Key features:
-- At-least-once execution with lease-based ownership
+- At-least-once execution with lease-based ownership and fencing
 - Automatic retries with exponential backoff
-- Dead letter queue for failed tasks
+- Dead letter queue with retry/delete/purge controls
 - Delayed task scheduling
+- Batched claims and ACKs (configurable `BATCH_SIZE`) with per-task heartbeat renewal
 - Optional Postgres journal for extra durability and reconciliation
 - gRPC API for task ingestion
+- HTTP/JSON read + control API and a small React/TanStack web console
 - Fully atomic state transitions using Lua scripts
 
 ## Quick Start
@@ -70,12 +82,17 @@ ForgeQueue consists of two main components that communicate through Redis:
 | --- | --- |
 | `internal/gateway` | gRPC server that validates requests, generates UUIDs, and enqueues tasks to Redis. Performs fail-fast ping on startup and graceful shutdown on SIGINT/SIGTERM. |
 | `internal/worker` | Queue engine with a worker pool (concurrency-limited goroutines), a recovery goroutine, and a promotion goroutine for scheduled tasks. |
+| `internal/httpapi` | HTTP/JSON read + control API used by the web console (stats, queues, jobs, workers, DLQ, delayed, pause/resume/purge). |
+| `internal/auth` | JWT (HS256) issuance/verification and role-based access control for the HTTP API. |
 | `internal/redisutil` | Thin wrapper around go-redis with fail-fast ping. |
 | `internal/model` | Defines `TaskMetaData` (the JSON payload stored in Redis). |
 | `internal/durable` | Optional Postgres journal. Records accepted tasks before writing to Redis and reconciles state on startup. Requires `FORGEQUEUE_PG_DSN`. |
 | `proto/v1` | Protobuf definitions and generated Go stubs. |
+| `web/` | React + TanStack Start console: logs in to the HTTP API and polls it. |
 
 Data flow: `Client -> Gateway (gRPC) -> Redis -> Worker Pool -> Handler`
+
+The console talks only to the HTTP API: `Browser -> HTTP API -> Redis`.
 
 ## API
 
@@ -98,6 +115,45 @@ service QueueService {
 }
 ```
 
+### HTTP / JSON API (console backend)
+
+The `apiserver` (`cmd/apiserver`) exposes read and control endpoints on
+`:8080` (`FORGEQUEUE_API_ADDR`). Every endpoint except `POST /api/auth/login`
+requires a JWT bearer token and a role that carries the relevant permission.
+
+| Method | Path | Permission | Purpose |
+| --- | --- | --- | --- |
+| POST | `/api/auth/login` | — | Exchange username/password for a bearer token |
+| GET | `/api/auth/me` | (any authenticated) | Current identity + roles |
+| GET | `/api/system/stats` | `system:read` | Totals: enqueued, processing, delayed, completed |
+| GET | `/api/system/version` | `system:read` | Build/version info |
+| GET | `/api/queues` | `queues:read` | Queue list with depth + paused status |
+| GET | `/api/queues/{name}` | `queues:read` | One queue |
+| GET | `/api/queues/{name}/jobs` | `jobs:read` | Jobs in a queue |
+| POST | `/api/queues/{name}/pause` \| `/resume` | `queues:write` | Pause / resume claiming |
+| POST | `/api/queues/{name}/purge` | `queues:write` | Drop all pending tasks |
+| GET | `/api/jobs/{id}` | `jobs:read` | One job |
+| POST | `/api/jobs/{id}/retry` \| `/requeue` | `jobs:write` | Re-enqueue a job |
+| DELETE | `/api/jobs/{id}` | `jobs:write` | Delete a job |
+| GET | `/api/workers` `/api/workers/{id}` | `workers:read` | Live workers and their leases |
+| GET | `/api/dlq` | `dlq:read` | Dead-letter entries |
+| POST | `/api/dlq/{id}/retry` | `dlq:write` | Retry one dead task |
+| DELETE | `/api/dlq/{id}` | `dlq:write` | Delete one dead task |
+| POST | `/api/dlq/purge` | `dlq:write` | Clear the DLQ |
+| GET | `/api/delayed` | `delayed:read` | Scheduled tasks |
+| POST | `/api/delayed/{id}/promote` | `delayed:write` | Run a delayed task now |
+| DELETE | `/api/delayed/{id}` | `delayed:write` | Cancel a delayed task |
+| GET | `/api/metrics/throughput` | `metrics:read` | Time-bucketed throughput series |
+
+Auth is configured from the environment (see [Configuration](#configuration)).
+If nothing is configured, the server bootstraps a single `admin` user and
+**logs the generated password** to stdout — pin it with `FORGEQUEUE_ADMIN_PASSWORD`
+or declare real users with `FORGEQUEUE_USERS`.
+
+> Because successful ACKs delete `task:<id>`, a **completed** job no longer has a
+> body and `GET /api/jobs/{id}` returns `404`. Completed jobs are meant to be
+> observed through the metrics/throughput endpoints, not looked up individually.
+
 ## Redis State
 
 | Key | Type | Purpose |
@@ -107,53 +163,97 @@ service QueueService {
 | `queue:tasks:leases` | Hash | Maps `taskID` to `leaseID` for ownership verification |
 | `queue:tasks:scheduled` | Sorted Set | Delayed or backoff tasks scored by execution timestamp |
 | `queue:tasks:dead` | List | Tasks that exhausted retry budget, with full bodies |
-| `task:<id>` | String | JSON-encoded task body (including attempts counter) |
+| `queue:paused` | String | Presence means the queue is paused (workers stop claiming) |
+| `task:<id>` | String | JSON-encoded task body (including attempts counter); deleted on successful ACK |
 
 All state transitions are executed atomically via Lua scripts to prevent race conditions.
 
 ## Task Lifecycle
 
 1. **Enqueue**: Gateway writes the task body to `task:<id>` and pushes the ID to the ready list (or scheduled set if delayed).
-2. **Claim**: An atomic Lua script pops a task from the ready list, registers it in the inflight set with a lease expiry, stores a lease token, and returns the task body.
-3. **Work**: The handler executes while a background heartbeat renews the lease at intervals.
-4. **ACK**: An atomic Lua script verifies ownership via the lease token and removes the task from inflight and leases.
-5. **Fail/Retry**: On error, the lease is released immediately. If retries remain, the task is rescheduled with exponential backoff; otherwise it goes to the dead letter queue.
+2. **Claim**: An atomic Lua script pops up to `BATCH_SIZE` tasks from the ready list, registers each in the inflight set with a lease expiry, stores a lease token per task, and returns the bodies. It returns nothing while `queue:paused` exists.
+3. **Work**: A heartbeat goroutine is started for **every** claimed task the moment the batch is claimed, not just the one currently executing. It renews each lease at `leaseDuration / 3` using Redis's own clock.
+4. **ACK**: Successful tasks are ACKed together in one fenced script that verifies each lease token, removes the task from inflight/leases, and deletes its body.
+5. **Fail/Retry**: On error, the lease is released immediately (fenced). If retries remain, the task is rescheduled with exponential backoff; otherwise it goes to the dead letter queue.
 6. **Recovery**: A recovery loop scans for expired leases and requeues or dead-letters them after re-verifying expiry atomically.
+
+The batch's heartbeats are only stopped **after** the ACK/requeue is committed. If they were stopped when the handler returned, a task that finished early would sit un-renewed while the rest of the batch drained; with a lease shorter than the batch drain time that lease would expire and recovery would run the task a second time.
 
 ## Reliability
 
 - **Lease-based ownership**: Each claim generates a unique lease token stored in Redis. All destructive operations verify this token, making Redis the source of truth across process boundaries.
-- **Heartbeats**: Long-running tasks renew their leases every `leaseDuration / 3`, preventing premature reclamation.
+- **Batched execution**: Each worker can claim up to `BATCH_SIZE` tasks in one atomic script and ACK them together. A heartbeat is started for every claimed task at claim time and kept alive until that task's ACK/requeue is committed, so tasks waiting behind the one executing cannot lose their lease.
+- **Heartbeats**: Long-running tasks renew their leases every `leaseDuration / 3` using Redis's clock, preventing premature reclamation.
+- **Sub-second lease precision**: Lease expiries are stored as fractional-second scores, so short leases are not silently truncated.
 - **Fencing**: Heartbeat, ACK, and requeue operations verify lease ownership atomically. Stale workers cannot mutate tasks they no longer own.
 - **Lease loss cancellation**: If a heartbeat fails, the handler's context is cancelled to allow early termination.
 - **Race-safe recovery**: Recovery re-verifies expiry inside Redis at reclamation time, closing the window between scan and requeue.
 - **Exponential backoff**: Retries use `base * 2^(attempts-1)` with a configurable cap. Tasks with `max_retries = 0` retry indefinitely.
-- **At-least-once semantics**: Due to lease expiry and crash recovery, handlers may receive duplicate executions and must be idempotent.
+- **Body cleanup**: A successfully ACKed task's `task:<id>` body is deleted in the same atomic ACK script.
+- **Graceful drain**: `Stop()` cancels the infra loops, waits up to the drain timeout for in-flight handlers to finish, then cancels the rest and de-registers the worker.
+- **At-least-once semantics**: Due to lease expiry and crash recovery, handlers may receive duplicate executions and must be idempotent. There is no exactly-once guarantee.
 
 ## Configuration
 
 | Setting | Location | Default |
 | --- | --- | --- |
-| Gateway Redis address | `gateway.Start()` | `localhost:6379` |
-| Gateway Redis pool size | `gateway.Start()` | 50 |
-| Worker Redis address | `NewWorkerPool(addr, concurrency)` | (required) |
-| Worker concurrency | `NewWorkerPool(addr, concurrency)` | (required) |
-| Worker Redis pool size | Derived | `concurrency * 2` |
+| Redis address | `FORGEQUEUE_REDIS_ADDR` | `localhost:6379` |
+| Gateway gRPC listen | `gateway.Start()` (hardcoded) | `:50051` |
+| Gateway metrics address | `FORGEQUEUE_METRICS_ADDR` | disabled |
+| HTTP API listen | `FORGEQUEUE_API_ADDR` | `:8080` |
+| Worker concurrency | `FORGEQUEUE_WORKER_CONCURRENCY` | 4 |
+| Worker batch size | `FORGEQUEUE_BATCH_SIZE` | 1 |
+| Worker metrics address | `FORGEQUEUE_METRICS_ADDR` | disabled |
+| Postgres journal | `FORGEQUEUE_PG_DSN` | disabled |
+| API auth secret | `FORGEQUEUE_AUTH_SECRET` | ephemeral (random, warns) |
+| API auth token TTL | `FORGEQUEUE_AUTH_TTL` | 12h |
+| API users (JSON) | `FORGEQUEUE_USERS` | bootstrapped admin |
+| Bootstrap admin user | `FORGEQUEUE_ADMIN_USER` | `admin` |
+| Bootstrap admin password | `FORGEQUEUE_ADMIN_PASSWORD` | random (logged) |
 | Lease duration | `wp.leaseDuration` (unexported) | 10s |
 | Heartbeat interval | Derived | `leaseDuration / 3` |
-| Recovery interval | `recoveryLoop` | 1s |
+| Recovery interval | `wp.recoveryInterval` | 1s |
+| Drain timeout | `WithDrainTimeout` | 30s |
 | Promotion interval | `promotionLoop` | 1s |
 | Backoff base | `wp.backoffBase` (unexported) | 1s |
 | Backoff cap | `wp.backoffCap` (unexported) | 60s |
 
-Set `FORGEQUEUE_PG_DSN` to enable the optional Postgres journal.
+## Running the whole stack
+
+```bash
+go build ./cmd/...
+redis-server &                       # or use your own Redis
+
+FORGEQUEUE_REDIS_ADDR=localhost:6379 ./gateway
+FORGEQUEUE_REDIS_ADDR=localhost:6379 \
+  FORGEQUEUE_ADMIN_PASSWORD=devpassword \
+  FORGEQUEUE_AUTH_SECRET=devsecret ./apiserver
+FORGEQUEUE_REDIS_ADDR=localhost:6379 \
+  FORGEQUEUE_WORKER_CONCURRENCY=16 \
+  FORGEQUEUE_BATCH_SIZE=4 \
+  FORGEQUEUE_METRICS_ADDR=:9100 ./worker &
+```
+
+(`apiserver` refuses to start without a working auth config; with no
+`FORGEQUEUE_USERS` it bootstraps an `admin` user — set `FORGEQUEUE_ADMIN_PASSWORD`
+here so you know the password. Then `POST /api/auth/login` to get a token.)
+
+Then load-test with the bundled generator (talks to the gateway over gRPC):
+
+```bash
+./loadgen -rate 200 -concurrency 8 -duration 30s \
+  -echo 60 -sleep 20 -fail 12 -delay 8 -sleep-max-ms 4000
+```
 
 ## Testing
 
-Tests require a local Redis instance on `localhost:6379` and will flush the database.
+Tests require a local Redis on `localhost:6379` and will flush that database —
+run them against a Redis you don't mind clearing.
 
 ```bash
-go test ./internal/worker/
+go test ./internal/worker/          # engine tests
+go test -race ./internal/worker/    # race check
+go test ./...                       # everything (Postgres tests skip unless set)
 ```
 
 Notable tests:
@@ -161,6 +261,8 @@ Notable tests:
 - `TestWorkerRequeueAfterFailure`: Tests retry with backoff on handler errors
 - `TestWorkerDeadLettersAfterRetryBudget`: Confirms tasks go to DLQ after exhausting retries
 - `TestWorkerDelayedTaskPromotion`: Verifies delayed tasks are promoted correctly
+- `TestWorkerBatchClaimsAndAcks` / `TestWorkerBatchMixedSuccessAndFailure`: Batched claim/ACK paths
+- `TestWorkerBatchLeaseKeptAlive`: Regression test for the batch lease bug — asserts every task in a slow batch runs exactly once
 
 Journal and reconciler tests exist under `internal/durable/` and require Postgres.
 
@@ -170,9 +272,12 @@ Measure pure drain throughput with a no-op handler:
 
 ```bash
 go test ./internal/worker/ -run=^$ -bench BenchmarkWorkerThroughputPreloaded -benchtime=10s -benchmem
+go test ./internal/worker/ -run=^$ -bench BenchmarkWorkerThroughputBatched     -benchtime=10s -benchmem
 ```
 
-Typical results on Apple Silicon (M2) with local Redis: ~8,000 to 12,000 tasks/s. The benchmark measures queue overhead only (two Redis round trips per task plus heartbeats); real workloads will differ.
+Typical results on Apple Silicon (M2) with local Redis: ~8,000 to 12,000 tasks/s
+single-task, higher with `BATCH_SIZE > 1`. The benchmarks measure queue overhead
+only (Redis round trips plus heartbeats); real workloads will differ.
 
 ## Failure Modes
 
@@ -187,44 +292,54 @@ Typical results on Apple Silicon (M2) with local Redis: ~8,000 to 12,000 tasks/s
 | Missing task body | Claimed but dropped by recovery as "no-body". |
 | Corrupt JSON in task body | Sent to dead letter queue. |
 | No handler for task type | Task is retried until budget exhausted, then dead-lettered. |
+| Queue paused (`queue:paused`) | Claim script returns nothing; in-flight tasks keep draining. |
+| Worker shutdown (SIGINT/SIGTERM) | Infrastructure loops stop, in-flight handlers drain up to the drain timeout, then are cancelled and the worker is de-registered. |
 
 ## Limitations
 
-- Completed task bodies (`task:<id>`) are not deleted automatically.
-- No authentication or TLS for Redis or gRPC.
-- Idle polling uses a 1ms interval; blocking variants are planned for production use.
+- **No exactly-once.** Delivery is at-least-once: a lease can expire (worker crash, Redis blip, GC pause) and a task can run twice. Handlers must be idempotent.
+- **Single Redis.** No replication, sharding, or failover logic — durability is whatever the Redis deployment provides.
+- **Partial auth.** The HTTP API has JWT + RBAC. The **gRPC gateway and Redis have no authentication or TLS**, and the HTTP API itself is plain HTTP. Do not expose any of it to a public network.
+- **No multi-tenancy / queue isolation.** "Queues" are a single logical namespace, not separate Redis keyspaces or broker connections.
+- **Completed bodies are deleted**, so a finished job cannot be looked up by ID afterwards (see the HTTP API note above).
+- **Idle polling** uses a short sleep interval per worker; blocking variants (e.g. `BLMOVE`) are not implemented.
+- **Bounded console.** The web UI logs in against the API and shows recent items; it is not a full admin plane (no user management, no audit log).
+- **Not battle-tested.** No soak testing, formal fault injection, or large-scale benchmarks beyond the simple drain benchmark below.
 
 ## Development Status
 
 **Implemented:**
 - gRPC gateway with validation, UUIDs, immediate/delayed enqueue, fail-fast startup, graceful shutdown
-- Worker pool with concurrent consumers, handler dispatch, clean shutdown
+- Worker pool with concurrent consumers, handler dispatch, clean shutdown, and graceful drain
 - Lease-based ownership with fencing on all destructive operations
-- Heartbeats, race-safe recovery, and context cancellation on lease loss
+- Per-task heartbeats from claim time; batched claims/ACKs (`BATCH_SIZE`)
+- Sub-second lease precision with regression coverage
 - Retry budget with exponential backoff and dead letter queue
 - Delayed task promotion
-- Body fetch folded into claim (2 Redis round trips per completed task)
+- Body fetch folded into claim and body cleanup on ACK
 - Optional Postgres journal with reconciliation
+- Prometheus metrics (worker + gateway) and a throughput/stats HTTP API
+- HTTP/JSON control API (pause/resume/purge, retry/requeue/delete, DLQ ops, delayed ops)
+- JWT + RBAC auth for the HTTP API
+- React + TanStack Start web console with login
+- gRPC load generator
 
-**In Progress:**
-- Batching claims and ACKs for improved throughput
-
-**Planned:**
-- Telemetry (throughput, latency, lease loss counters)
+**Planned / explicitly out of scope:**
 - Smarter idle polling (blocking operations)
 - Multi-instance deployment hardening
+- AuthN/AuthZ and multi-tenancy
+- A streaming/Kafka-style log layer (deliberately not pursued — different problem)
 
 ## Design Notes
 
 All critical operations use Lua scripts for atomicity:
-- **Claim** (1 round trip): Pop from ready list, add to inflight with expiry, store lease token, fetch body.
-- **Heartbeat** (1 round trip): Verify lease token and extend expiry using Redis time.
-- **ACK** (1 round trip): Verify lease token and remove from inflight/leases.
-- **Requeue/DLQ** (1 round trip): Verify expiry or release lease, load body, increment attempts, schedule backoff or push to DLQ.
-- **Promote** (1 round trip): Check scheduled task time against Redis TIME and move to ready list.
-
-The main remaining cost is round trips; batching multiple claims/ACKs per script is the planned optimization for higher throughput.
+- **Claim** (1 round trip): Pop up to `BATCH_SIZE` IDs from the ready list, add each to inflight with an expiry, store a lease token per task, fetch each body. Returns nothing while paused.
+- **Heartbeat** (1 round trip): Verify the lease token and extend the expiry using Redis's TIME (fractional seconds).
+- **ACK** (1 round trip for the batch): Verify each lease token, remove from inflight/leases, and delete the body for each ACKed task.
+- **Requeue/DLQ** (1 round trip): Verify expiry or release the lease, load the body, increment attempts, schedule backoff or push to DLQ.
+- **Promote** (1 round trip): Check the scheduled task's time against Redis TIME and move it to the ready list.
 
 ## License
 
-This project does not currently include a license file. All rights reserved unless a license is added. Please contact the author before reusing this code.
+Licensed under the [Apache License, Version 2.0](LICENSE).
+Copyright 2026 Yash Bahuguna.

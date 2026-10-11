@@ -539,3 +539,104 @@ func BenchmarkWorkerThroughputPreloaded(b *testing.B) {
 	}
 	b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "tasks/sec")
 }
+
+// slowCountingHandler records how many times each task ID was handled and
+// sleeps for a fixed duration on every call, so a test can make a handler
+// outlast its lease.
+type slowCountingHandler struct {
+	mu    sync.Mutex
+	calls map[string]int
+	sleep time.Duration
+}
+
+func (h *slowCountingHandler) Handle(ctx context.Context, task *model.TaskMetaData) error {
+	h.mu.Lock()
+	h.calls[task.ID]++
+	h.mu.Unlock()
+
+	select {
+	case <-time.After(h.sleep):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (h *slowCountingHandler) Counts() map[string]int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]int, len(h.calls))
+	for k, v := range h.calls {
+		out[k] = v
+	}
+	return out
+}
+
+// TestWorkerBatchLeaseKeptAlive is the regression test for the batch lease
+// bug. With batchSize > 1 a whole batch is claimed at once, so every task in
+// it gets the same initial lease expiry. The batch is handled sequentially: if
+// the earlier tasks take longer than the lease, the later tasks would have no
+// heartbeat and their leases would expire mid-batch. The recovery loop would
+// then requeue them and they would run a second time.
+//
+// The fix starts a heartbeat for every claimed task the moment the batch is
+// claimed, so no task in an in-progress batch is ever recovered. The test uses
+// a short lease, a fast recovery loop and a handler that outlasts the lease,
+// so any duplicate execution is caught deterministically.
+func TestWorkerBatchLeaseKeptAlive(t *testing.T) {
+	wp, err := NewWorkerPool(testRedisAddr, 1)
+	if err != nil {
+		t.Fatalf("new worker pool: %v", err)
+	}
+	// A one-second lease with a fast recovery loop makes an expired lease
+	// show up almost immediately, while the handler below outlasts it and a
+	// whole batch takes several leases to drain.
+	wp.leaseDuration = 1 * time.Second
+	wp.recoveryInterval = 50 * time.Millisecond
+	wp.backoffBase = 100 * time.Millisecond
+	handler := &slowCountingHandler{calls: map[string]int{}, sleep: 700 * time.Millisecond}
+	wp.RegisterHandler("noop", handler)
+	wp.WithBatchSize(4)
+
+	if err := wp.redisClient.FlushDB(wp.ctx).Err(); err != nil {
+		t.Fatalf("flush db: %v", err)
+	}
+
+	const n = 8
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uuid.NewString()
+		enqueueTask(t, wp, ids[i], 0)
+	}
+
+	wp.Start()
+	defer wp.Stop()
+
+	// Wait until every task has been handled at least once.
+	waitFor(t, 20*time.Second, "all tasks handled", func() bool {
+		counts := handler.Counts()
+		if len(counts) != n {
+			return false
+		}
+		for _, c := range counts {
+			if c < 1 {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Give the fast recovery loop time to wrongly re-run anything whose
+	// lease it thinks has expired.
+	time.Sleep(1 * time.Second)
+
+	counts := handler.Counts()
+	if len(counts) != n {
+		t.Fatalf("handler saw %d distinct task(s), want %d", len(counts), n)
+	}
+	for id, c := range counts {
+		if c != 1 {
+			t.Fatalf("task %s ran %d times, want exactly 1 (batch lease was not kept alive)", id, c)
+		}
+	}
+}

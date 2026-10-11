@@ -1,0 +1,114 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// ErrInvalidCredentials is returned when a username is unknown or the password
+// does not match. It is deliberately identical in both cases.
+var ErrInvalidCredentials = errors.New("invalid credentials")
+
+// Identity is the authenticated principal attached to a request. Permissions
+// are derived from Roles at authentication time.
+type Identity struct {
+	Username    string       `json:"username"`
+	Roles       []Role       `json:"roles"`
+	Permissions []Permission `json:"permissions"`
+}
+
+// Can reports whether the identity holds permission p.
+func (i Identity) Can(p Permission) bool { return hasPermission(i.Permissions, p) }
+
+// User is a configured account. PasswordHash is never serialized.
+type User struct {
+	Username     string
+	PasswordHash string
+	Roles        []Role
+}
+
+type ctxKey struct{}
+
+// WithIdentity returns a context carrying the authenticated identity.
+func WithIdentity(ctx context.Context, id Identity) context.Context {
+	return context.WithValue(ctx, ctxKey{}, id)
+}
+
+// FromContext returns the identity attached to ctx, if any.
+func FromContext(ctx context.Context) (Identity, bool) {
+	id, ok := ctx.Value(ctxKey{}).(Identity)
+	return id, ok
+}
+
+// Service authenticates users and issues/verifies bearer tokens.
+type Service struct {
+	users  map[string]*User
+	tokens *tokenManager
+}
+
+// NewService builds a Service from already-resolved users and secrets.
+func NewService(users []User, secret []byte, ttl time.Duration) (*Service, error) {
+	if len(secret) == 0 {
+		return nil, errors.New("auth: empty signing secret")
+	}
+	if ttl <= 0 {
+		ttl = 12 * time.Hour
+	}
+	byName := make(map[string]*User, len(users))
+	for i := range users {
+		u := users[i]
+		if u.Username == "" {
+			return nil, errors.New("auth: user with empty username")
+		}
+		if _, dup := byName[u.Username]; dup {
+			return nil, errors.New("auth: duplicate user " + u.Username)
+		}
+		for _, r := range u.Roles {
+			if !ValidRole(r) {
+				return nil, errors.New("auth: user " + u.Username + " has unknown role " + string(r))
+			}
+		}
+		byName[u.Username] = &u
+	}
+	return &Service{
+		users:  byName,
+		tokens: &tokenManager{secret: secret, ttl: ttl},
+	}, nil
+}
+
+// Authenticate verifies credentials and returns the resulting identity.
+func (s *Service) Authenticate(username, password string) (Identity, error) {
+	u, ok := s.users[username]
+	if !ok || !verifyPassword(password, u.PasswordHash) {
+		return Identity{}, ErrInvalidCredentials
+	}
+	return s.identityFor(u.Username, u.Roles), nil
+}
+
+// IssueToken mints a bearer token for an identity.
+func (s *Service) IssueToken(id Identity) (string, time.Time, error) {
+	return s.tokens.issue(id.Username, id.Roles)
+}
+
+// VerifyToken validates a bearer token and reconstructs the identity. The user
+// must still exist, so deleting an account revokes its outstanding tokens.
+func (s *Service) VerifyToken(token string) (Identity, error) {
+	c, err := s.tokens.verify(token)
+	if err != nil {
+		return Identity{}, err
+	}
+	u, ok := s.users[c.Subject]
+	if !ok {
+		return Identity{}, ErrInvalidToken
+	}
+	return s.identityFor(u.Username, u.Roles), nil
+}
+
+func (s *Service) identityFor(username string, roles []Role) Identity {
+	return Identity{
+		Username:    username,
+		Roles:       append([]Role(nil), roles...),
+		Permissions: permissionsForRoles(roles),
+	}
+}

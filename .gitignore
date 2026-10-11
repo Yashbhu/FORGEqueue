@@ -6,3 +6,24 @@
 
 # local study notes, keep out of the public repo
 docs/
+
+# compiled binaries (build them with `go build ./cmd/...`)
+/gateway
+/worker
+/apiserver
+/loadgen
+
+# go test artifacts
+*.test
+coverage.out
+
+# web build output
+node_modules/
+web/dist/
+web/.output/
+web/.vinxi/
+web/.tanstack/
+
+# local env
+.env
+.env.local

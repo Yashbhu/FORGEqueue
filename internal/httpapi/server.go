@@ -1,0 +1,164 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"forgequeue/internal/auth"
+)
+
+type Server struct {
+	srv  *http.Server
+	auth *auth.Service
+}
+
+func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	s := &Server{auth: authSvc}
+	h := NewHandler(rdb, authSvc)
+	mux := http.NewServeMux()
+
+	// Public endpoints.
+	mux.HandleFunc("POST /api/auth/login", h.Login)
+	mux.HandleFunc("GET /api/system/version", h.Version)
+
+	// Authenticated endpoints, each gated by a permission.
+	mux.HandleFunc("GET /api/auth/me", s.require("", h.Me))
+	mux.HandleFunc("GET /api/system/stats", s.require(auth.PermSystemRead, h.Stats))
+	mux.HandleFunc("GET /api/queues", s.require(auth.PermQueuesRead, h.Queues))
+	mux.HandleFunc("GET /api/queues/{name}", s.require(auth.PermQueuesRead, func(w http.ResponseWriter, r *http.Request) {
+		h.Queue(w, r, r.PathValue("name"))
+	}))
+	mux.HandleFunc("GET /api/queues/{name}/jobs", s.require(auth.PermJobsRead, func(w http.ResponseWriter, r *http.Request) {
+		h.QueueJobs(w, r, r.PathValue("name"))
+	}))
+	mux.HandleFunc("POST /api/queues/{name}/pause", s.require(auth.PermQueuesWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.PauseQueue(w, r, r.PathValue("name"))
+	}))
+	mux.HandleFunc("POST /api/queues/{name}/resume", s.require(auth.PermQueuesWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.ResumeQueue(w, r, r.PathValue("name"))
+	}))
+	mux.HandleFunc("POST /api/queues/{name}/purge", s.require(auth.PermQueuesWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.PurgeQueue(w, r, r.PathValue("name"))
+	}))
+	mux.HandleFunc("GET /api/jobs/{id}", s.require(auth.PermJobsRead, func(w http.ResponseWriter, r *http.Request) {
+		h.Job(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("POST /api/jobs/{id}/retry", s.require(auth.PermJobsWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.RetryJob(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("POST /api/jobs/{id}/requeue", s.require(auth.PermJobsWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.RequeueJob(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("DELETE /api/jobs/{id}", s.require(auth.PermJobsWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.DeleteJob(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("GET /api/workers", s.require(auth.PermWorkersRead, h.Workers))
+	mux.HandleFunc("GET /api/workers/{id}", s.require(auth.PermWorkersRead, func(w http.ResponseWriter, r *http.Request) {
+		h.Worker(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("GET /api/dlq", s.require(auth.PermDLQRead, h.DLQ))
+	mux.HandleFunc("POST /api/dlq/purge", s.require(auth.PermDLQWrite, h.PurgeDLQ))
+	mux.HandleFunc("POST /api/dlq/{id}/retry", s.require(auth.PermDLQWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.RetryDLQ(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("DELETE /api/dlq/{id}", s.require(auth.PermDLQWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.DeleteDLQ(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("GET /api/delayed", s.require(auth.PermDelayedRead, h.Delayed))
+	mux.HandleFunc("POST /api/delayed/{id}/promote", s.require(auth.PermDelayedWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.PromoteDelayed(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("DELETE /api/delayed/{id}", s.require(auth.PermDelayedWrite, func(w http.ResponseWriter, r *http.Request) {
+		h.CancelDelayed(w, r, r.PathValue("id"))
+	}))
+	mux.HandleFunc("GET /api/metrics/throughput", s.require(auth.PermMetricsRead, h.Throughput))
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           corsMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	s.srv = srv
+	return s
+}
+
+// require wraps a handler with bearer-token authentication and an optional
+// permission check. An empty perm authenticates without authorizing.
+func (s *Server) require(perm auth.Permission, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := s.authenticate(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		if perm != "" && !id.Can(perm) {
+			writeError(w, http.StatusForbidden, "insufficient permissions")
+			return
+		}
+		next(w, r.WithContext(auth.WithIdentity(r.Context(), id)))
+	}
+}
+
+// authenticate extracts and verifies the Authorization: Bearer token.
+func (s *Server) authenticate(r *http.Request) (auth.Identity, bool) {
+	if s.auth == nil {
+		return auth.Identity{}, false
+	}
+	const prefix = "bearer "
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return auth.Identity{}, false
+	}
+	token := strings.TrimSpace(header[len(prefix):])
+	if token == "" {
+		return auth.Identity{}, false
+	}
+	id, err := s.auth.VerifyToken(token)
+	if err != nil {
+		return auth.Identity{}, false
+	}
+	return id, true
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) Start() error {
+	go func() {
+		_ = s.srv.ListenAndServe()
+	}()
+	return nil
+}
+
+func (s *Server) Stop(ctx context.Context) error {
+	return s.srv.Shutdown(ctx)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"message": msg})
+}

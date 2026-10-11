@@ -138,6 +138,9 @@ func (tr *TaskRouter) RouteTask(
 		// adjusted here: the depth gauges are sampled from Redis, which
 		// already counted this push.
 		tr.metrics.TasksEnqueued.Add(ctx, 1)
+		now := time.Now().Unix()
+		tr.redisClient.ZAdd(ctx, "metrics:enqueued", redis.Z{Score: float64(now), Member: id})
+		tr.redisClient.Expire(ctx, "metrics:enqueued", 24*time.Hour)
 		return nil
 	}
 
@@ -177,5 +180,8 @@ func (tr *TaskRouter) RouteTask(
 	}
 
 	tr.metrics.TasksEnqueued.Add(ctx, 1)
+	now := time.Now().Unix()
+	tr.redisClient.ZAdd(ctx, "metrics:enqueued", redis.Z{Score: float64(now), Member: id})
+	tr.redisClient.Expire(ctx, "metrics:enqueued", 24*time.Hour)
 	return nil
 }

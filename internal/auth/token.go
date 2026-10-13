@@ -12,13 +12,11 @@ import (
 )
 
 // ErrInvalidToken is returned for any token that fails signature or shape
-// validation. Callers should not distinguish the reasons to avoid leaking
-// information about why a token was rejected.
+// validation. Callers should not distinguish the reasons.
 var ErrInvalidToken = errors.New("invalid token")
 
-// claims is the JWT payload. Roles are embedded so the API can authorize a
-// request without a Redis round trip; this means a role change takes effect on
-// the next login (until then, the old roles remain valid until expiry).
+// claims is the JWT payload. Roles are embedded so the API can authorize
+// without a Redis round trip. A role change only takes effect on next login.
 type claims struct {
 	Subject string   `json:"sub"`
 	Roles   []string `json:"roles"`

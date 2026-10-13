@@ -13,7 +13,9 @@ export default defineConfig({
       // Use src/server.ts as the SSR entry (see src/server.ts).
       server: { entry: "server" },
     }),
-    nitro({ preset: "cloudflare-module" }),
+    // Default to the Cloudflare Workers output; container builds override with
+    // NITRO_PRESET=node-server to produce a standalone Node server.
+    nitro({ preset: process.env.NITRO_PRESET ?? "cloudflare-module" }),
     viteReact(),
   ],
   // Pre-bundle UI deps up front so a mid-session re-optimization can't load two React copies.

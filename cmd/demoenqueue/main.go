@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	queuev1 "forgequeue/proto/v1"
 )
@@ -18,9 +19,11 @@ import (
 func main() {
 	rounds := flag.Int("n", 1, "how many times to send the batch of tasks")
 	interval := flag.Duration("interval", 0, "wait between rounds")
+	addr := flag.String("gateway", "localhost:50051", "gateway gRPC address")
+	token := flag.String("token", "", "bearer token (gateway rejects anonymous calls)")
 	flag.Parse()
 
-	conn, err := grpc.NewClient("localhost:50051",
+	conn, err := grpc.NewClient(*addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal(err)
@@ -29,9 +32,16 @@ func main() {
 
 	c := queuev1.NewQueueServiceClient(conn)
 
-	// Two 8s sleeps per round. Long enough that the p95 graph has a real
-	// curve in it, and that a task is still in flight whenever you go to
-	// screenshot, which is what makes the queue-depth panel look alive.
+	// Auth header is applied per-call; unauthenticated calls hit the
+	// interceptor's Unauthenticated error.
+	authorized := func(ctx context.Context) context.Context {
+		if *token != "" {
+			return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+*token)
+		}
+		return ctx
+	}
+
+	// Two 8s sleeps per round so something is in flight when you screenshot.
 	sleep8 := []byte(`{"duration_ms":8000}`)
 
 	jobs := []struct {
@@ -54,10 +64,10 @@ func main() {
 			fmt.Printf("round %d/%d\n", r, *rounds)
 		}
 		for _, j := range jobs {
-			// Per-task timeout, not one timeout for the whole run: a slow
-			// round should not abort the rounds after it.
+			// Time out each task on its own so one slow round does not abort
+			// the rest.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			resp, err := c.EnqueueTask(ctx, &queuev1.EnqueueTaskRequest{
+			resp, err := c.EnqueueTask(authorized(ctx), &queuev1.EnqueueTaskRequest{
 				TaskType:     j.kind,
 				Payload:      j.payload,
 				MaxRetries:   3,

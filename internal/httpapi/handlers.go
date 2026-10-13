@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,11 +16,15 @@ import (
 type Handler struct {
 	rdb  *redis.Client
 	auth *auth.Service
+	oidc *auth.OIDC
 }
 
 func NewHandler(rdb *redis.Client, authSvc *auth.Service) *Handler {
 	return &Handler{rdb: rdb, auth: authSvc}
 }
+
+// setOIDC enables the single sign-on handlers.
+func (h *Handler) setOIDC(o *auth.OIDC) { h.oidc = o }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	writeJSON(w, status, v)
@@ -71,6 +76,88 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	}
 	h.writeJSON(w, http.StatusOK, id)
 }
+
+// AuthConfig advertises which login methods are available.
+func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := AuthConfig{Password: h.auth.HasLocalUsers()}
+	if h.oidc != nil {
+		cfg.OIDC = true
+		cfg.Provider = h.oidc.ProviderName()
+	}
+	h.writeJSON(w, http.StatusOK, cfg)
+}
+
+// OIDCLogin begins the SSO flow and redirects the browser to the provider.
+func (h *Handler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
+	if h.oidc == nil {
+		h.writeError(w, http.StatusNotFound, "single sign-on is not enabled")
+		return
+	}
+	target, err := h.oidc.Begin(r.Context(), r.URL.Query().Get("redirect"))
+	if err != nil {
+		h.writeError(w, http.StatusBadGateway, "single sign-on is unavailable")
+		return
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// OIDCCallback handles the provider redirect and passes a one-time code
+// back to the console.
+func (h *Handler) OIDCCallback(w http.ResponseWriter, r *http.Request) {
+	if h.oidc == nil {
+		h.writeError(w, http.StatusNotFound, "single sign-on is not enabled")
+		return
+	}
+	q := r.URL.Query()
+	if msg := q.Get("error"); msg != "" {
+		redirectTo(w, r, h.oidc.DefaultReturn(), map[string]string{"error": msg})
+		return
+	}
+	otc, sess, err := h.oidc.Complete(r.Context(), q.Get("state"), q.Get("code"))
+	if err != nil {
+		redirectTo(w, r, h.oidc.DefaultReturn(), map[string]string{"error": "sso_failed"})
+		return
+	}
+	redirectTo(w, r, sess.WebReturn, map[string]string{"code": otc})
+}
+
+// OIDCExchange exchanges the one-time code for a bearer token.
+func (h *Handler) OIDCExchange(w http.ResponseWriter, r *http.Request) {
+	if h.oidc == nil {
+		h.writeError(w, http.StatusNotFound, "single sign-on is not enabled")
+		return
+	}
+	var req ExchangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		h.writeError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+	sess, err := h.oidc.Exchange(r.Context(), req.Code)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "invalid or expired code")
+		return
+	}
+	h.writeJSON(w, http.StatusOK, LoginResponse{
+		Token:     sess.Token,
+		ExpiresAt: sess.ExpiresAt.UTC().Format(time.RFC3339),
+		User:      sess.Identity,
+	})
+}
+
+// redirectTo sends the browser to target, appending the given query params.
+func redirectTo(w http.ResponseWriter, r *http.Request, target string, params map[string]string) {
+	dest, err := url.Parse(target)
+	if err != nil {
+		dest = &url.URL{Path: "/"}
+	}
+	q := dest.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	dest.RawQuery = q.Encode()
+	http.Redirect(w, r, dest.String(), http.StatusFound)
+}
+
 func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	pending := int(h.rdb.LLen(ctx, "queue:tasks:immediate").Val())
@@ -199,9 +286,8 @@ func (h *Handler) readTaskFull(r *http.Request, id string) (*Job, bool, error) {
 	return job, true, nil
 }
 
-// isDead reports whether a task body with the given ID is present in the
-// dead-letter list. The dead list stores full JSON bodies, so membership is
-// checked by parsing each entry rather than by matching the raw list value.
+// isDead reports whether a task with the given ID is in the dead list.
+// Entries are full JSON bodies, so we parse each one to match the ID.
 func (h *Handler) isDead(ctx context.Context, id string) bool {
 	bodies, err := h.rdb.LRange(ctx, "queue:tasks:dead", 0, -1).Result()
 	if err != nil {
@@ -216,8 +302,8 @@ func (h *Handler) isDead(ctx context.Context, id string) bool {
 	return false
 }
 
-// pausedKey is set while the queue is paused. The worker's claim script
-// checks for its presence and stops handing out work until it is cleared.
+// pausedKey is set while the queue is paused. Workers check for it
+// before claiming work.
 const pausedKey = "queue:paused"
 
 // queueStatus reports whether the queue is currently accepting work.
@@ -228,9 +314,8 @@ func (h *Handler) queueStatus(ctx context.Context) QueueStatus {
 	return QueueHealthy
 }
 
-// takeDead removes and returns the stored body of a task parked in the
-// dead-letter list. The dead list holds full JSON bodies, so the entry is
-// located by parsing rather than by matching an ID.
+// takeDead removes and returns the body of a task sitting in the dead list.
+// Entries are full JSON bodies, so we parse to find the matching ID.
 func (h *Handler) takeDead(ctx context.Context, id string) ([]byte, bool, error) {
 	bodies, err := h.rdb.LRange(ctx, "queue:tasks:dead", 0, -1).Result()
 	if err != nil {
@@ -241,8 +326,8 @@ func (h *Handler) takeDead(ctx context.Context, id string) ([]byte, bool, error)
 	for _, body := range bodies {
 		var tm TaskMetaData
 		if json.Unmarshal([]byte(body), &tm) == nil && tm.ID == id {
-			// Keep the first body we see, but clear every matching entry: the
-			// same task can appear more than once in the dead list.
+			// Keep the first match but remove every one. A task can appear
+			// more than once in the dead list.
 			if !ok {
 				found = []byte(body)
 				ok = true
@@ -255,16 +340,13 @@ func (h *Handler) takeDead(ctx context.Context, id string) ([]byte, bool, error)
 	return found, ok, nil
 }
 
-// requeue puts a task back on the ready list, clearing any stale membership
-// in the scheduled or inflight sets first. resetAttempts restores the retry
-// budget, which is what a manual "retry" should do.
+// requeue puts a task back on the ready list after clearing it from the
+// scheduled and inflight sets. resetAttempts zeroes the attempt count.
 //
-// The body is taken from task:<id> when present, otherwise recovered from the
-// dead-letter list. When neither holds it, the task is reported as missing.
+// The body comes from task:<id>, or from the dead list if that is gone.
 func (h *Handler) requeue(ctx context.Context, id string, resetAttempts bool) (bool, error) {
-	// Always clear the dead-letter list first, even if a body still exists in
-	// task:<id>: a task can leave stale copies behind there. The recovered
-	// body is only needed when task:<id> has already been dropped.
+	// Always clear the dead list first, a task can leave stale copies there.
+	// The recovered body is only needed when task:<id> is gone.
 	deadBody, wasDead, err := h.takeDead(ctx, id)
 	if err != nil {
 		return false, err
@@ -392,9 +474,8 @@ func (h *Handler) Worker(w http.ResponseWriter, r *http.Request, id string) {
 	h.writeError(w, http.StatusNotFound, fmt.Sprintf("worker %s not found", id))
 }
 
-// registeredWorker mirrors the document the worker pool publishes at
-// worker:<id>:meta. It lives here (not in the worker package) so the API
-// stays decoupled from worker internals.
+// registeredWorker mirrors the doc the worker pool writes to worker:<id>:meta.
+// It lives here to keep the API decoupled from worker internals.
 type registeredWorker struct {
 	ID            string `json:"id"`
 	Hostname      string `json:"hostname"`
@@ -405,10 +486,8 @@ type registeredWorker struct {
 	Concurrency   int    `json:"concurrency"`
 }
 
-// readWorkers assembles the live worker list from the registry Redis keys.
-// Stale registrations (meta key expired, or heartbeat older than the healthy
-// window) are reported with status "stale" rather than dropped, so the
-// dashboard can see a worker that stopped heartbeating.
+// readWorkers builds the worker list from the registry keys. Workers whose
+// heartbeat is old are marked "stale" instead of dropped.
 func (h *Handler) readWorkers(ctx context.Context) []Worker {
 	ids, err := h.rdb.SMembers(ctx, "forgequeue:workers").Result()
 	if err != nil {
@@ -455,9 +534,8 @@ func (h *Handler) readWorkers(ctx context.Context) []Worker {
 	return workers
 }
 
-// readWorkerLeases returns the leases a worker is actively holding. A task is
-// only counted if Redis still knows about its lease, which filters out IDs
-// left behind after a crash.
+// readWorkerLeases returns the leases a worker is holding. A task only
+// counts if Redis still has its lease, which drops IDs left over from a crash.
 func (h *Handler) readWorkerLeases(ctx context.Context, id string) []Lease {
 	ids, err := h.rdb.SMembers(ctx, "worker:"+id+":leases").Result()
 	if err != nil {
@@ -665,7 +743,6 @@ func genSeries(rangeQ string, rdb *redis.Client, ctx context.Context) []Throughp
 		bucketEnd := bucketStart.Add(step)
 		start := bucketStart.Unix()
 		end := bucketEnd.Unix()
-		// Count real events in this bucket
 		enq := int(rdb.ZCount(ctx, "metrics:enqueued", fmt.Sprint(start), fmt.Sprint(end)).Val())
 		comp := int(rdb.ZCount(ctx, "metrics:completed", fmt.Sprint(start), fmt.Sprint(end)).Val())
 		fail := int(rdb.ZCount(ctx, "metrics:failed", fmt.Sprint(start), fmt.Sprint(end)).Val())

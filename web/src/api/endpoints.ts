@@ -12,8 +12,16 @@ import { request } from "./client";
 
 export type MetricsRange = "5m" | "15m" | "1h" | "6h" | "24h" | "7d";
 
+export interface AuthConfig {
+  password: boolean;
+  oidc: boolean;
+  provider?: string;
+}
+
 export interface Api {
+  authConfig(): Promise<AuthConfig>;
   login(username: string, password: string): Promise<Session>;
+  exchangeOidc(code: string): Promise<Session>;
   me(): Promise<SessionUser>;
   stats(): Promise<SystemStats>;
   queues(): Promise<QueueSummary[]>;
@@ -41,7 +49,9 @@ export interface Api {
 
 const e = encodeURIComponent;
 const httpApi: Api = {
+  authConfig: () => request("GET", "/auth/config"),
   login: (username, password) => request("POST", "/auth/login", { username, password }),
+  exchangeOidc: (code) => request("POST", "/auth/oidc/exchange", { code }),
   me: () => request("GET", "/auth/me"),
   stats: () => request("GET", "/system/stats"),
   queues: () => request("GET", "/queues"),

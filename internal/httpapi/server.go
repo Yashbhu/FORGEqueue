@@ -15,6 +15,8 @@ import (
 type Server struct {
 	srv  *http.Server
 	auth *auth.Service
+	oidc *auth.OIDC
+	h    *Handler
 }
 
 func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
@@ -26,12 +28,27 @@ func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
 	h := NewHandler(rdb, authSvc)
 	mux := http.NewServeMux()
 
-	// Public endpoints.
-	mux.HandleFunc("POST /api/auth/login", h.Login)
-	mux.HandleFunc("GET /api/system/version", h.Version)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "redis unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
 
-	// Authenticated endpoints, each gated by a permission.
+	mux.HandleFunc("POST /api/auth/login", h.Login)
+	mux.HandleFunc("GET /api/auth/config", h.AuthConfig)
+	mux.HandleFunc("GET /api/auth/oidc/login", h.OIDCLogin)
+	mux.HandleFunc("GET /api/auth/oidc/callback", h.OIDCCallback)
+	mux.HandleFunc("POST /api/auth/oidc/exchange", h.OIDCExchange)
+
 	mux.HandleFunc("GET /api/auth/me", s.require("", h.Me))
+	mux.HandleFunc("GET /api/system/version", s.require(auth.PermSystemRead, h.Version))
 	mux.HandleFunc("GET /api/system/stats", s.require(auth.PermSystemRead, h.Stats))
 	mux.HandleFunc("GET /api/queues", s.require(auth.PermQueuesRead, h.Queues))
 	mux.HandleFunc("GET /api/queues/{name}", s.require(auth.PermQueuesRead, func(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +105,16 @@ func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	s.srv = srv
+	s.h = h
 	return s
+}
+
+// SetOIDC enables single sign-on on the server. Call before Start.
+func (s *Server) SetOIDC(o *auth.OIDC) {
+	s.oidc = o
+	if s.h != nil {
+		s.h.setOIDC(o)
+	}
 }
 
 // require wraps a handler with bearer-token authentication and an optional

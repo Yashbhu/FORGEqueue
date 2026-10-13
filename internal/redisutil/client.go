@@ -14,7 +14,7 @@ func NewClient(addr string, poolSize int, ctx context.Context) (*redis.Client, e
 		Addr:     addr,
 		PoolSize: poolSize,
 	})
-	// fail fast: ping the redis server to check if it's available
+	// ping to check the server is up
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, err
 	}

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,15 +15,12 @@ import (
 //
 //	pbkdf2$sha256$<iterations>$<salt-b64>$<derived-key-b64>
 //
-// Only the standard library is used so the server has no crypto dependency to
-// manage. Verification is constant-time.
+// Verification is constant-time.
 const (
 	pbkdf2Iterations = 210_000
 	pbkdf2KeyLength  = 32
 	pbkdf2SaltLength = 16
 )
-
-var errBadHash = errors.New("malformed password hash")
 
 func hashPassword(password string) (string, error) {
 	salt := make([]byte, pbkdf2SaltLength)

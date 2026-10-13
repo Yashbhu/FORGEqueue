@@ -5,12 +5,9 @@ import (
 	"time"
 )
 
-// State is the lifecycle state of a task as the journal records it.
-//
-// The journal is the durable side of the queue: plain rows in Postgres that
-// survive crashes, Redis restarts and even a Redis flush. The hot side of
-// the queue (Redis lists and sorted sets) is the part that moves fast; this
-// table is the part that remembers.
+// State is the lifecycle state of a task as the journal records it. The
+// journal is the durable side of the queue, plain Postgres rows that survive
+// a crash or a Redis flush.
 type State string
 
 const (
@@ -28,12 +25,9 @@ const (
 	StateDead State = "dead"
 )
 
-// Task is the durable record for one task, as far as the journal cares.
-//
-// Payload is the exact JSON body Redis stores at task:<id>. Keeping the body
-// in Postgres is what lets the reconciler rebuild Redis state from scratch
-// after a crash or a Redis flush: it re-SETs the body and re-inserts the ID
-// into whichever queue the state says it belongs in.
+// Task is the durable record for one task. Payload is the exact JSON body
+// Redis stores at task:<id>, which lets the reconciler rebuild Redis from
+// scratch after a crash or flush.
 type Task struct {
 	ID         string
 	TaskType   string
@@ -41,20 +35,25 @@ type Task struct {
 	MaxRetries int32
 	Attempts   int32
 	State      State
-	// ScheduleAt is when an enqueued/retrying task is due. The zero value
-	// signals "no delay" - the task belongs in the immediate queue.
+	// ScheduleAt is when an enqueued/retrying task is due. Zero means no
+	// delay, so it goes to the immediate queue.
 	ScheduleAt time.Time
 	CreatedAt  time.Time
 }
 
-// Store is the durable half of the queue. The contract with the caller is
-// best-effort: queue correctness lives in Redis, this journal exists so Redis
-// state can be repaired. Every method is safe to treat as optional - a Nop
-// Store absorbs the call and does nothing.
+// Cursor is a keyset pagination position over (CreatedAt, ID). The zero value
+// means "start from the beginning".
+type Cursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// Store is the durable half of the queue. It is best-effort: queue
+// correctness lives in Redis and the journal only exists to repair it. A Nop
+// Store absorbs calls and does nothing.
 type Store interface {
-	// Enqueue records a newly accepted task. It leaves redis_pending = true,
-	// meaning "the journal knows about this task but can't yet prove Redis
-	// does" - the reconciler closes that gap.
+	// Enqueue records a newly accepted task and leaves redis_pending = true
+	// until the reconciler confirms Redis holds it.
 	Enqueue(ctx context.Context, t Task) error
 	// Processing marks a task as claimed by a worker.
 	Processing(ctx context.Context, id string) error
@@ -63,19 +62,21 @@ type Store interface {
 	// Dead marks a task as dead-lettered. Terminal.
 	Dead(ctx context.Context, id string, attempts int32) error
 	// Retrying records the new attempt count and backoff schedule for a task
-	// the worker already put back into Redis, so redis_pending is cleared.
+	// already put back into Redis.
 	Retrying(ctx context.Context, id string, attempts int32, scheduleAt time.Time) error
-	// Pending returns the tasks redis_pending = true: know by the journal,
-	// unproven in Redis. The reconciler works through this list.
-	Pending(ctx context.Context) ([]Task, error)
-	// Materialized clears redis_pending after the task was (re)written into
-	// Redis.
+	// Active returns a page of non-terminal tasks (enqueued, processing,
+	// retrying) ordered by (created_at, id) after the cursor. The reconciler
+	// re-verifies each one against Redis, so a Redis restart or flush that
+	// drops an already-materialized task can still be healed. Terminal tasks
+	// are never returned.
+	Active(ctx context.Context, after Cursor, limit int) ([]Task, error)
+	// Materialized clears redis_pending after the task is in Redis.
 	Materialized(ctx context.Context, id string) error
 	Close() error
 }
 
-// Nop is a Store that does nothing. It is the default, so a queue without
-// Postgres configured behaves exactly as it did before the storage split.
+// Nop is a Store that does nothing. It is the default when no Postgres is
+// configured.
 type Nop struct{}
 
 func (Nop) Enqueue(context.Context, Task) error                      { return nil }
@@ -83,6 +84,6 @@ func (Nop) Processing(context.Context, string) error                 { return ni
 func (Nop) Succeeded(context.Context, string) error                  { return nil }
 func (Nop) Dead(context.Context, string, int32) error                { return nil }
 func (Nop) Retrying(context.Context, string, int32, time.Time) error { return nil }
-func (Nop) Pending(context.Context) ([]Task, error)                  { return nil, nil }
+func (Nop) Active(context.Context, Cursor, int) ([]Task, error)      { return nil, nil }
 func (Nop) Materialized(context.Context, string) error               { return nil }
 func (Nop) Close() error                                             { return nil }

@@ -13,6 +13,9 @@ docs/
 /apiserver
 /loadgen
 
+# pre-built binaries copied into docker build context
+*-binary
+
 # go test artifacts
 *.test
 coverage.out
@@ -27,3 +30,6 @@ web/.tanstack/
 # local env
 .env
 .env.local
+
+# BullMQ comparison harness: track the source, ignore installed deps
+bench/bullmq/node_modules/

@@ -9,17 +9,12 @@ import (
 )
 
 // DefaultDSN points at a local Postgres running the forgequeue database.
-// Override it with FORGEQUEUE_PG_DSN when Postgres lives elsewhere
-// (docker-compose, CI, a real deployment).
+// Override with FORGEQUEUE_PG_DSN.
 const DefaultDSN = "postgres://localhost:5432/forgequeue"
 
-// The schema is one table. Every enqueued task gets a row; the row follows
-// the task through its lifecycle until the task is succeeded or dead.
-//
-// payload is BYTEA (not JSONB) on purpose: it is the byte-for-byte JSON body
-// Redis stores, so the reconciler can rebuild Redis without re-encoding the
-// task. JSONB would be nicer for querying, but querying bodies is not what
-// this table is for.
+// One table, one row per enqueued task, following it until succeeded or dead.
+// payload is BYTEA not JSONB: it is the exact body Redis stores, so the
+// reconciler can rebuild Redis without re-encoding.
 const schema = `
 CREATE TABLE IF NOT EXISTS queue_tasks (
     id            TEXT PRIMARY KEY,
@@ -34,11 +29,13 @@ CREATE TABLE IF NOT EXISTS queue_tasks (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- The reconciler only ever scans the rows that need Redis materialized, so
--- the scan should not touch the finished history.
-CREATE INDEX IF NOT EXISTS queue_tasks_pending_idx
-    ON queue_tasks (redis_pending)
-    WHERE redis_pending = TRUE;
+-- The reconciler scans non-terminal tasks in (created_at, id) order, so the
+-- index only covers those rows. Terminal history is skipped entirely.
+CREATE INDEX IF NOT EXISTS queue_tasks_active_idx
+    ON queue_tasks (created_at, id)
+    WHERE state IN ('enqueued', 'processing', 'retrying');
+
+DROP INDEX IF EXISTS queue_tasks_pending_idx;
 `
 
 // Postgres is a Store backed by PostgreSQL.
@@ -46,8 +43,15 @@ type Postgres struct {
 	pool *pgxpool.Pool
 }
 
-// NewPostgres connects to Postgres, fails fast if it is unreachable, and
-// makes sure the schema exists.
+// NewPostgres connects to Postgres and makes sure the schema exists. Returns
+// an error if Postgres is unreachable.
+// advisoryLock serializes one-time schema creation across pods. Multiple
+// replicas (gateway + workers) all call NewPostgres on boot, and executing the
+// same CREATE/INDEX DDL concurrently raises transient catalog races (e.g.
+// duplicate key on pg_type_typname_nsp_index). The lock is transaction-scoped,
+// so it releases when the commit ends.
+const advisoryLock int64 = 884422
+
 func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -58,10 +62,36 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 		return nil, fmt.Errorf("durable: ping postgres: %w", err)
 	}
 	if _, err := pool.Exec(ctx, schema); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("durable: ensure schema: %w", err)
+		// A concurrent peer may be mid-migration (gateway and workers all
+		// initialize on boot). Retry a few times before giving up.
+		if err := ensureSchema(ctx, pool); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("durable: ensure schema: %w", err)
+		}
 	}
 	return &Postgres{pool: pool}, nil
+}
+
+func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLock); err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if _, err := tx.Exec(ctx, schema); err != nil {
+			tx.Rollback(ctx)
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		return tx.Commit(ctx)
+	}
+	return lastErr
 }
 
 func (p *Postgres) Close() error {
@@ -70,8 +100,8 @@ func (p *Postgres) Close() error {
 }
 
 // Enqueue upserts the task and always leaves redis_pending = true. The
-// gateway calls this before touching Redis: if the process dies in between,
-// the reconciler re-materializes the task and nothing is lost.
+// gateway calls this before touching Redis, so a crash in between is healed
+// by the reconciler.
 func (p *Postgres) Enqueue(ctx context.Context, t Task) error {
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO queue_tasks
@@ -105,14 +135,13 @@ func (p *Postgres) Dead(ctx context.Context, id string, attempts int32) error {
 }
 
 // Retrying records the backoff schedule the worker just wrote into Redis.
-// attempts and schedule_at come from the requeue script's own math, so the
-// journal mirrors what Redis actually decided - never the other way around.
+// attempts and schedule_at come from the requeue script, so the journal
+// mirrors Redis rather than the other way around.
 func (p *Postgres) Retrying(ctx context.Context, id string, attempts int32, scheduleAt time.Time) error {
 	return p.setState(ctx, id, string(StateRetrying), attempts, &scheduleAt)
 }
 
-// setState is the shared UPDATE. attempts = -1 leaves the counter untouched
-// (the worker did not change it).
+// setState is the shared UPDATE. attempts = -1 leaves the counter untouched.
 func (p *Postgres) setState(ctx context.Context, id string, state string, attempts int32, scheduleAt *time.Time) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE queue_tasks
@@ -126,18 +155,23 @@ func (p *Postgres) setState(ctx context.Context, id string, state string, attemp
 	return err
 }
 
-// Pending returns the tasks the journal knows about but Redis has not proven
-// it holds. Only active states can need materialization - a succeeded or
-// dead task never goes back into a queue.
-func (p *Postgres) Pending(ctx context.Context) ([]Task, error) {
+// Active returns a page of non-terminal tasks ordered by (created_at, id),
+// strictly after the cursor. Every non-terminal task is re-verified against
+// Redis on every sweep, so a task that was materialized and then lost when
+// Redis restarted is rebuilt. Rows are keyset-paginated so a large active set
+// is walked a page at a time instead of starved by an OFFSET/LIMIT window.
+func (p *Postgres) Active(ctx context.Context, after Cursor, limit int) ([]Task, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
 	rows, err := p.pool.Query(ctx, `
 		SELECT id, task_type, payload, max_retries, attempts, state, schedule_at, created_at
 		FROM queue_tasks
-		WHERE redis_pending = TRUE
-		  AND state IN ('`+string(StateEnqueued)+`', '`+string(StateProcessing)+`', '`+string(StateRetrying)+`')
-		ORDER BY created_at
-		LIMIT 1000
-	`)
+		WHERE state IN ('`+string(StateEnqueued)+`', '`+string(StateProcessing)+`', '`+string(StateRetrying)+`')
+		  AND (created_at, id) > ($1, $2)
+		ORDER BY created_at, id
+		LIMIT $3
+	`, after.CreatedAt, after.ID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +195,7 @@ func (p *Postgres) Pending(ctx context.Context) ([]Task, error) {
 	return tasks, rows.Err()
 }
 
-// Materialized clears redis_pending now that Redis provably holds the task.
+// Materialized clears redis_pending once Redis holds the task.
 func (p *Postgres) Materialized(ctx context.Context, id string) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE queue_tasks SET redis_pending = FALSE, updated_at = now() WHERE id = $1
@@ -169,8 +203,8 @@ func (p *Postgres) Materialized(ctx context.Context, id string) error {
 	return err
 }
 
-// nullableTime converts a Go time to the *time.Time Postgres wants for a
-// NULL-able column. The zero time means "immediate" and maps to NULL.
+// nullableTime maps a Go time to a nullable column. Zero means immediate, so
+// it becomes NULL.
 func nullableTime(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil

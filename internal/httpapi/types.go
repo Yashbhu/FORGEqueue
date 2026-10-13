@@ -19,6 +19,18 @@ type LoginResponse struct {
 	User      auth.Identity `json:"user"`
 }
 
+// AuthConfig describes the login methods the server offers.
+type AuthConfig struct {
+	Password bool   `json:"password"`
+	OIDC     bool   `json:"oidc"`
+	Provider string `json:"provider,omitempty"`
+}
+
+// ExchangeRequest carries the one-time SSO code used to get a session token.
+type ExchangeRequest struct {
+	Code string `json:"code"`
+}
+
 type JobStatus string
 
 const (

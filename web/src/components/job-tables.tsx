@@ -5,9 +5,11 @@ import { api } from "@/api/endpoints";
 import { useAction, useBulk } from "@/api/queries";
 import { DataTable } from "./data-table";
 import { ConfirmDialog } from "./confirm-dialog";
+import { Can } from "./can";
 import { Duration, JobId, Mono, StatusBadge, TimeAgo, useNow } from "./shared";
 import { Button } from "@/components/ui/button";
 import { fmtDuration } from "@/lib/format";
+import { useHasPermission } from "@/lib/auth";
 import type { DelayedJob, Job } from "@/types/forgequeue";
 
 export function BulkBar({
@@ -35,31 +37,34 @@ export function JobsTable({ jobs, showQueue }: { jobs: Job[] | undefined; showQu
   const [sel, setSel] = useState<Set<string>>(new Set());
   const retry = useBulk(api.retryJob, "Retried");
   const del = useBulk(api.deleteJob, "Deleted");
+  const canWrite = useHasPermission("jobs:write");
   useNow(5000);
   const ids = [...sel];
   return (
     <>
       <BulkBar count={sel.size} onClear={() => setSel(new Set())}>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-6 text-xs"
-          onClick={() => (retry.mutate(ids), setSel(new Set()))}
-        >
-          <RotateCcw className="size-3" /> Retry
-        </Button>
-        <ConfirmDialog
-          trigger={
-            <Button variant="outline" size="sm" className="h-6 text-xs text-destructive">
-              <Trash2 className="size-3" /> Delete
-            </Button>
-          }
-          destructive
-          title={`Delete ${sel.size} jobs?`}
-          description={`This permanently removes ${sel.size} jobs from Redis and PostgreSQL. This cannot be undone.`}
-          confirmLabel={`Delete ${sel.size} jobs`}
-          onConfirm={() => (del.mutate(ids), setSel(new Set()))}
-        />
+        <Can perm="jobs:write">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 text-xs"
+            onClick={() => (retry.mutate(ids), setSel(new Set()))}
+          >
+            <RotateCcw className="size-3" /> Retry
+          </Button>
+          <ConfirmDialog
+            trigger={
+              <Button variant="outline" size="sm" className="h-6 text-xs text-destructive">
+                <Trash2 className="size-3" /> Delete
+              </Button>
+            }
+            destructive
+            title={`Delete ${sel.size} jobs?`}
+            description={`This permanently removes ${sel.size} jobs from Redis and PostgreSQL. This cannot be undone.`}
+            confirmLabel={`Delete ${sel.size} jobs`}
+            onConfirm={() => (del.mutate(ids), setSel(new Set()))}
+          />
+        </Can>
       </BulkBar>
       <DataTable
         rows={jobs}
@@ -130,22 +135,26 @@ export function JobsTable({ jobs, showQueue }: { jobs: Job[] | undefined; showQu
                 <span className="text-muted-foreground">—</span>
               ),
           },
-          {
-            key: "a",
-            header: "",
-            align: "right",
-            cell: (j) =>
-              ["failed", "retrying", "cancelled"].includes(j.status) ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-1.5 text-xs"
-                  onClick={() => retry.mutate([j.id])}
-                >
-                  <RotateCcw className="size-3" /> Retry
-                </Button>
-              ) : null,
-          },
+          ...(canWrite
+            ? [
+                {
+                  key: "a",
+                  header: "",
+                  align: "right" as const,
+                  cell: (j: Job) =>
+                    ["failed", "retrying", "cancelled"].includes(j.status) ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-1.5 text-xs"
+                        onClick={() => retry.mutate([j.id])}
+                      >
+                        <RotateCcw className="size-3" /> Retry
+                      </Button>
+                    ) : null,
+                },
+              ]
+            : []),
         ]}
       />
     </>
@@ -160,6 +169,7 @@ export function DelayedTable({
   showQueue?: boolean;
 }) {
   const now = useNow(1000);
+  const canWrite = useHasPermission("delayed:write");
   const promote = useAction(api.promoteDelayed, (id) => `Promoted ${id.slice(0, 8)} to pending`);
   const cancel = useAction(api.cancelDelayed, (id) => `Cancelled ${id.slice(0, 8)}`);
   return (
@@ -203,49 +213,57 @@ export function DelayedTable({
           },
         },
         { key: "st", header: "Status", cell: (d) => <StatusBadge status={d.status} /> },
-        {
-          key: "a",
-          header: "Actions",
-          align: "right",
-          cell: (d) => (
-            <span className="inline-flex gap-0.5">
-              <ConfirmDialog
-                trigger={
-                  <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs">
-                    <Zap className="size-3" /> Promote
-                  </Button>
-                }
-                title="Promote job now?"
-                description={
-                  <>
-                    Job <code className="font-mono">{d.jobId}</code> will be moved to{" "}
-                    <code className="font-mono">{d.queue}</code> pending immediately, skipping its
-                    scheduled delay.
-                  </>
-                }
-                confirmLabel="Promote now"
-                onConfirm={() => promote.mutate(d.jobId)}
-              />
-              <ConfirmDialog
-                trigger={
-                  <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs text-destructive">
-                    <X className="size-3" /> Cancel
-                  </Button>
-                }
-                destructive
-                title="Cancel scheduled job?"
-                description={
-                  <>
-                    Job <code className="font-mono">{d.jobId}</code> will be marked cancelled and
-                    never run.
-                  </>
-                }
-                confirmLabel="Cancel job"
-                onConfirm={() => cancel.mutate(d.jobId)}
-              />
-            </span>
-          ),
-        },
+        ...(canWrite
+          ? [
+              {
+                key: "a",
+                header: "Actions",
+                align: "right" as const,
+                cell: (d: DelayedJob) => (
+                  <span className="inline-flex gap-0.5">
+                    <ConfirmDialog
+                      trigger={
+                        <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs">
+                          <Zap className="size-3" /> Promote
+                        </Button>
+                      }
+                      title="Promote job now?"
+                      description={
+                        <>
+                          Job <code className="font-mono">{d.jobId}</code> will be moved to{" "}
+                          <code className="font-mono">{d.queue}</code> pending immediately, skipping
+                          its scheduled delay.
+                        </>
+                      }
+                      confirmLabel="Promote now"
+                      onConfirm={() => promote.mutate(d.jobId)}
+                    />
+                    <ConfirmDialog
+                      trigger={
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-xs text-destructive"
+                        >
+                          <X className="size-3" /> Cancel
+                        </Button>
+                      }
+                      destructive
+                      title="Cancel scheduled job?"
+                      description={
+                        <>
+                          Job <code className="font-mono">{d.jobId}</code> will be marked cancelled
+                          and never run.
+                        </>
+                      }
+                      confirmLabel="Cancel job"
+                      onConfirm={() => cancel.mutate(d.jobId)}
+                    />
+                  </span>
+                ),
+              },
+            ]
+          : []),
       ]}
     />
   );

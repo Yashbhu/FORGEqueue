@@ -1,0 +1,34 @@
+# VCS + editor noise
+.git
+.gitignore
+.DS_Store
+
+# docs and local study/benchmark material
+docs
+bench
+
+# redis persistence dumps
+*.rdb
+
+# pre-built host binaries (rebuild them from source in the image)
+/gateway
+/worker
+/apiserver
+/loadgen
+*-binary
+
+# go test artifacts
+*.test
+coverage.out
+
+# web dependencies and build output (installed/rebuilt inside the image)
+web/node_modules
+web/.output
+web/.tanstack
+web/.wrangler
+web/dist
+
+# local env files can leak dev-only API bases into the build; use build args
+web/.env
+web/.env.local
+web/.env.*.local

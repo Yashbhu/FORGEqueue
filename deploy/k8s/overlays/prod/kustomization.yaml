@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: forgequeue
+
+resources:
+  - ../../base
+
+# forgequeue-secrets is applied out of band (SOPS + age), not generated here.
+# It MUST include FORGEQUEUE_AUTH_SECRET, FORGEQUEUE_ADMIN_USER/PASSWORD, and
+# POSTGRES_PASSWORD (the base derives FORGEQUEUE_PG_DSN from it). For an
+# external managed Postgres, override FORGEQUEUE_PG_DSN in the secret too.
+
+images:
+  - name: forgequeue/worker
+    newName: ghcr.io/yashbhu/forgequeue-worker
+    newTag: v1.0.0
+  - name: forgequeue/gateway
+    newName: ghcr.io/yashbhu/forgequeue-gateway
+    newTag: v1.0.0
+  - name: forgequeue/apiserver
+    newName: ghcr.io/yashbhu/forgequeue-apiserver
+    newTag: v1.0.0
+  - name: forgequeue/web
+    newName: ghcr.io/yashbhu/forgequeue-web
+    newTag: v1.0.0
+
+replicas:
+  - name: worker
+    count: 3
+  - name: gateway
+    count: 2
+  - name: apiserver
+    count: 2
+  - name: web
+    count: 2

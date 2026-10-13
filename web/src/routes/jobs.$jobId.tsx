@@ -3,6 +3,7 @@ import { RotateCcw, Trash2, Undo2 } from "lucide-react";
 import { api } from "@/api/endpoints";
 import { useAction, useJob } from "@/api/queries";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { Can } from "@/components/can";
 import { JsonViewer } from "@/components/json-viewer";
 import { DataTable } from "@/components/data-table";
 import {
@@ -150,7 +151,7 @@ function JobDetail() {
           </>
         }
         actions={
-          <>
+          <Can perm="jobs:write">
             <ConfirmDialog
               trigger={
                 <Button size="sm" variant="outline" className="h-7 text-xs">
@@ -195,7 +196,7 @@ function JobDetail() {
                 })
               }
             />
-          </>
+          </Can>
         }
       />
       <div className="grid gap-3 lg:grid-cols-3">

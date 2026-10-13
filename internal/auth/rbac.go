@@ -19,8 +19,8 @@ const (
 	PermMetricsRead  Permission = "metrics:read"
 )
 
-// Role groups permissions. Roles are assigned to users; permissions are never
-// assigned directly so the surface stays small and auditable.
+// Role groups permissions. Roles are assigned to users, permissions are
+// never assigned directly.
 type Role string
 
 const (
@@ -29,8 +29,8 @@ const (
 	RoleViewer   Role = "viewer"
 )
 
-// rolePermissions is the single source of truth for what each role can do.
-// Every permission known to the API must appear in at least one role.
+// rolePermissions maps each role to its permissions. Every permission
+// must appear in at least one role.
 var rolePermissions = map[Role][]Permission{
 	RoleViewer: {
 		PermSystemRead,

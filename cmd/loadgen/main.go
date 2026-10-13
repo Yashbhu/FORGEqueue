@@ -1,10 +1,5 @@
-// Command loadgen drives ForgeQueue with a continuous, realistic mix of tasks
-// so the dashboard has live traffic to show. Unlike demoenqueue (a fixed
-// burst), loadgen runs until stopped and keeps a steady target rate.
-//
-// It enqueues over the same gRPC API the gateway exposes, choosing each task
-// from a weighted mix of echo, sleep, fail and delayed work. Results are
-// reported as a running summary once a second.
+// Command loadgen sends a steady mix of tasks over the gateway gRPC API so the
+// dashboard has live traffic.
 package main
 
 import (
@@ -22,12 +17,14 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	queuev1 "forgequeue/proto/v1"
 )
 
 func main() {
 	addr := flag.String("gateway", "localhost:50051", "gateway gRPC address")
+	token := flag.String("token", "", "bearer token (gateway rejects anonymous calls)")
 	rate := flag.Float64("rate", 40, "target enqueue rate in tasks per second")
 	concurrency := flag.Int("concurrency", 8, "parallel enqueue goroutines")
 	duration := flag.Duration("duration", 0, "run time; 0 means run until interrupted")
@@ -41,7 +38,7 @@ func main() {
 	seed := flag.Int64("seed", time.Now().UnixNano(), "random seed")
 	flag.Parse()
 
-	// Each goroutine owns its own rand.Source, which is not safe to share.
+	// rand.Rand is not safe to share, so each goroutine seeds its own.
 	rng := rand.New(rand.NewSource(*seed))
 
 	conn, err := grpc.NewClient(*addr,
@@ -120,6 +117,9 @@ func main() {
 					// Cap each call so one slow enqueue cannot stall the
 					// goroutine forever.
 					callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					if *token != "" {
+						callCtx = metadata.AppendToOutgoingContext(callCtx, "authorization", "Bearer "+*token)
+					}
 					_, err := client.EnqueueTask(callCtx, req)
 					cancel()
 					if err != nil {
@@ -161,9 +161,8 @@ func pick(r *rand.Rand, mix []struct {
 	return "echo"
 }
 
-// buildRequest turns a task kind into a concrete gRPC request. Sleep tasks get
-// a random duration and delayed tasks a random delay, so neither the latency
-// graph nor the delayed panel is flat.
+// buildRequest builds a request for kind, with random durations for sleep and
+// delayed tasks.
 func buildRequest(r *rand.Rand, kind string, maxRetries, sleepMaxMs, delayMaxS int) *queuev1.EnqueueTaskRequest {
 	req := &queuev1.EnqueueTaskRequest{
 		TaskType:   kind,
@@ -181,7 +180,7 @@ func buildRequest(r *rand.Rand, kind string, maxRetries, sleepMaxMs, delayMaxS i
 		req.TaskType = "echo"
 		req.Payload = []byte(`{"note":"delayed from loadgen"}`)
 		req.DelaySeconds = int32(1 + r.Intn(delayMaxS))
-	default: // echo
+	default:
 		req.TaskType = "echo"
 		req.Payload = []byte(fmt.Sprintf(`{"note":"loadgen echo","n":%d}`, r.Intn(1_000_000)))
 	}

@@ -74,6 +74,69 @@ if err != nil {
 fmt.Printf("Enqueued task %s\n", resp.TaskId)
 ```
 
+## Run with Docker
+
+Build every image from source — multi-stage, nothing is copied in pre-built:
+
+```bash
+docker build -f dockerfiles/worker.Dockerfile    -t forgequeue/worker:latest    .
+docker build -f dockerfiles/gateway.Dockerfile   -t forgequeue/gateway:latest   .
+docker build -f dockerfiles/apiserver.Dockerfile -t forgequeue/apiserver:latest .
+docker build -f dockerfiles/web.Dockerfile       -t forgequeue/web:latest       .
+```
+
+The four Go services are distroless static binaries running as a non-root user;
+the console is a Node SSR server (Nitro `node-server` output), not a static
+bundle. Bring the stack up on one network:
+
+```bash
+docker network create forgequeue
+docker run -d --name redis --network forgequeue redis:7.4-alpine --appendonly yes
+docker run -d --name gateway   --network forgequeue -e FORGEQUEUE_REDIS_ADDR=redis:6379 forgequeue/gateway:latest
+docker run -d --name worker    --network forgequeue -e FORGEQUEUE_REDIS_ADDR=redis:6379 \
+  -e FORGEQUEUE_WORKER_CONCURRENCY=16 -e FORGEQUEUE_BATCH_SIZE=4 forgequeue/worker:latest
+docker run -d --name apiserver --network forgequeue -p 8080:8080 \
+  -e FORGEQUEUE_REDIS_ADDR=redis:6379 -e FORGEQUEUE_AUTH_SECRET=devsecret \
+  -e FORGEQUEUE_ADMIN_PASSWORD=devpassword forgequeue/apiserver:latest
+docker run -d --name web --network forgequeue -p 3000:3000 forgequeue/web:latest
+```
+
+The console is then on http://localhost:3000 and the API on
+http://localhost:8080. The web image bakes `VITE_API_BASE_URL=/api` by default,
+which assumes a reverse proxy in front; to hit a browser-reachable API origin
+directly, rebuild it with
+`--build-arg VITE_API_BASE_URL=http://localhost:8080/api`.
+
+## Kubernetes
+
+A Kustomize tree lives under `deploy/k8s`. `base/` holds Redis and the four
+services as Deployments (non-root, read-only root filesystem, dropped
+capabilities, health probes, resource limits, a Redis-gated init container),
+plus an Ingress, HPAs and PodDisruptionBudgets. Two overlays:
+
+- `overlays/kind` — local kind cluster: `:latest` images loaded from your daemon
+  and a **dev-only** Secret generated in-cluster.
+- `overlays/prod` — `ghcr.io/yashbhu/forgequeue-*:v1.0.0`, scaled replicas, and
+  no Secret (apply `forgequeue-secrets` out of band, e.g. SOPS + age).
+
+```bash
+kind create cluster --name forgequeue --config deploy/k8s/kind-config.yaml
+kind load docker-image forgequeue/worker:latest forgequeue/gateway:latest \
+  forgequeue/apiserver:latest forgequeue/web:latest --name forgequeue
+kubectl apply -k deploy/k8s/overlays/kind
+kubectl -n forgequeue get pods
+```
+
+Redis runs a single replica on a PersistentVolumeClaim with AOF enabled, so
+queued tasks survive a pod restart. Worker and apiserver autoscale on CPU with
+the HPAs in `base/` — the cluster needs `metrics-server` for those targets to
+resolve. Note that the worker idle-polls, so a **CPU-based** HPA scales on
+polling overhead rather than queue depth; a queue-depth scaler (e.g. KEDA) would
+be the accurate signal. Metrics are scraped via the `ServiceMonitor` in
+`deploy/k8s/observability`, which is applied separately **after** installing
+kube-prometheus-stack (the `monitoring.coreos.com` CRDs must exist). The Ingress
+targets the `forgequeue.local` host and needs an ingress-nginx controller.
+
 ## Architecture
 
 ForgeQueue consists of two main components that communicate through Redis:
@@ -118,12 +181,18 @@ service QueueService {
 ### HTTP / JSON API (console backend)
 
 The `apiserver` (`cmd/apiserver`) exposes read and control endpoints on
-`:8080` (`FORGEQUEUE_API_ADDR`). Every endpoint except `POST /api/auth/login`
-requires a JWT bearer token and a role that carries the relevant permission.
+`:8080` (`FORGEQUEUE_API_ADDR`). Every endpoint except the login endpoints
+(`POST /api/auth/login`, `GET /api/auth/config`, and the `GET
+/api/auth/oidc/*` SSO flow) requires a JWT bearer token and a role that carries
+the relevant permission.
 
 | Method | Path | Permission | Purpose |
 | --- | --- | --- | --- |
 | POST | `/api/auth/login` | — | Exchange username/password for a bearer token |
+| GET | `/api/auth/config` | — | Which login methods are enabled (password / SSO) |
+| GET | `/api/auth/oidc/login` | — | Start the SSO redirect (auth-code + PKCE) |
+| GET | `/api/auth/oidc/callback` | — | SSO provider callback; returns a one-time code |
+| POST | `/api/auth/oidc/exchange` | — | Trade the one-time code for a bearer token |
 | GET | `/api/auth/me` | (any authenticated) | Current identity + roles |
 | GET | `/api/system/stats` | `system:read` | Totals: enqueued, processing, delayed, completed |
 | GET | `/api/system/version` | `system:read` | Build/version info |
@@ -146,9 +215,21 @@ requires a JWT bearer token and a role that carries the relevant permission.
 | GET | `/api/metrics/throughput` | `metrics:read` | Time-bucketed throughput series |
 
 Auth is configured from the environment (see [Configuration](#configuration)).
-If nothing is configured, the server bootstraps a single `admin` user and
-**logs the generated password** to stdout — pin it with `FORGEQUEUE_ADMIN_PASSWORD`
-or declare real users with `FORGEQUEUE_USERS`.
+The recommended setup is **single sign-on**: point the server at any OpenID
+Connect provider (Google, Okta, Auth0, Keycloak, Entra ID) with
+`FORGEQUEUE_OIDC_ISSUER` and the console offers a "Continue with …" button — the
+provider owns accounts, passwords, MFA and revocation, so there is nothing to
+create or store here. Roles are assigned by email allowlist
+(`FORGEQUEUE_OIDC_ADMIN_EMAILS`, `FORGEQUEUE_OIDC_OPERATOR_EMAILS`) or a default
+role for everyone else.
+
+For a local, provider-less deployment you can instead use username/password
+accounts. If nothing is configured, the server bootstraps a single `admin` user
+and **logs the generated password** to stdout — pin it with
+`FORGEQUEUE_ADMIN_PASSWORD` or declare real users with `FORGEQUEUE_USERS`. When
+SSO is enabled and no local accounts are configured, the bootstrap admin is
+skipped entirely (set `FORGEQUEUE_ADMIN_PASSWORD` or `FORGEQUEUE_USERS` if you
+want a break-glass account).
 
 > Because successful ACKs delete `task:<id>`, a **completed** job no longer has a
 > body and `GET /api/jobs/{id}` returns `404`. Completed jobs are meant to be
@@ -210,6 +291,17 @@ The batch's heartbeats are only stopped **after** the ACK/requeue is committed. 
 | API users (JSON) | `FORGEQUEUE_USERS` | bootstrapped admin |
 | Bootstrap admin user | `FORGEQUEUE_ADMIN_USER` | `admin` |
 | Bootstrap admin password | `FORGEQUEUE_ADMIN_PASSWORD` | random (logged) |
+| SSO issuer (enables OIDC) | `FORGEQUEUE_OIDC_ISSUER` | disabled |
+| SSO client id | `FORGEQUEUE_OIDC_CLIENT_ID` | — |
+| SSO client secret | `FORGEQUEUE_OIDC_CLIENT_SECRET` | — (PKCE; optional) |
+| SSO callback URL | `FORGEQUEUE_OIDC_REDIRECT_URL` | — |
+| SSO provider label | `FORGEQUEUE_OIDC_PROVIDER_NAME` | issuer host |
+| SSO scopes | `FORGEQUEUE_OIDC_SCOPES` | `openid email profile` |
+| SSO admin emails | `FORGEQUEUE_OIDC_ADMIN_EMAILS` | — |
+| SSO operator emails | `FORGEQUEUE_OIDC_OPERATOR_EMAILS` | — |
+| SSO default role | `FORGEQUEUE_OIDC_DEFAULT_ROLE` | `viewer` (`none` to deny) |
+| SSO allowed return origins | `FORGEQUEUE_OIDC_ALLOWED_ORIGINS` | web URL only |
+| Console web URL | `FORGEQUEUE_WEB_URL` | `/` |
 | Lease duration | `wp.leaseDuration` (unexported) | 10s |
 | Heartbeat interval | Derived | `leaseDuration / 3` |
 | Recovery interval | `wp.recoveryInterval` | 1s |
@@ -237,6 +329,23 @@ FORGEQUEUE_REDIS_ADDR=localhost:6379 \
 (`apiserver` refuses to start without a working auth config; with no
 `FORGEQUEUE_USERS` it bootstraps an `admin` user — set `FORGEQUEUE_ADMIN_PASSWORD`
 here so you know the password. Then `POST /api/auth/login` to get a token.)
+
+To run behind SSO instead, register a confidential/web client with your provider
+and set the callback to `<api>/api/auth/oidc/callback`:
+
+```bash
+FORGEQUEUE_REDIS_ADDR=localhost:6379 \
+  FORGEQUEUE_AUTH_SECRET=devsecret \
+  FORGEQUEUE_OIDC_ISSUER=https://accounts.google.com \
+  FORGEQUEUE_OIDC_CLIENT_ID=xxxx.apps.googleusercontent.com \
+  FORGEQUEUE_OIDC_CLIENT_SECRET=xxxx \
+  FORGEQUEUE_OIDC_REDIRECT_URL=http://localhost:8080/api/auth/oidc/callback \
+  FORGEQUEUE_WEB_URL=http://localhost:3000 \
+  FORGEQUEUE_OIDC_ADMIN_EMAILS=you@example.com ./apiserver
+```
+
+For local testing without a real provider, [Dex](https://dexidp.io) or Keycloak
+both work; point `FORGEQUEUE_OIDC_ISSUER` at their discovery URL.
 
 Then load-test with the bundled generator (talks to the gateway over gRPC):
 
@@ -268,16 +377,34 @@ Journal and reconciler tests exist under `internal/durable/` and require Postgre
 
 ## Benchmarks
 
-Measure pure drain throughput with a no-op handler:
+Measure pure drain throughput with a no-op handler (worker concurrency 4, 50k
+preloaded tasks):
 
 ```bash
 go test ./internal/worker/ -run=^$ -bench BenchmarkWorkerThroughputPreloaded -benchtime=10s -benchmem
 go test ./internal/worker/ -run=^$ -bench BenchmarkWorkerThroughputBatched     -benchtime=10s -benchmem
 ```
 
-Typical results on Apple Silicon (M2) with local Redis: ~8,000 to 12,000 tasks/s
-single-task, higher with `BATCH_SIZE > 1`. The benchmarks measure queue overhead
-only (Redis round trips plus heartbeats); real workloads will differ.
+Results on an Apple M2 with a local Redis. Handlers are no-ops, so this is pure
+queue overhead (Redis round trips plus heartbeats):
+
+| Implementation | Claim style | Throughput |
+| --- | --- | --- |
+| ForgeQueue | one task per claim (`BATCH_SIZE=1`) | ~4,100 tasks/s |
+| ForgeQueue | batch claim of 16 (`BATCH_SIZE=16`) | ~14,600 tasks/s |
+| BullMQ 5 | one job per claim (concurrency 4) | ~12,600 jobs/s |
+
+The batch claim is where ForgeQueue pulls ahead: at concurrency 4 a one-task
+claim pays a full Redis round trip per task, while a 16-task claim amortizes one
+round trip across the batch. Out of the box (`BATCH_SIZE=1`) it is *slower* than
+BullMQ — the win only shows up once batching is on. Reproduce the BullMQ side
+with the bundled same-machine harness:
+
+```bash
+cd bench/bullmq && npm install && JOBS=50000 CONCURRENCY=4 node bench.js
+```
+
+Real handlers dominate throughput in practice, so treat these as an upper bound.
 
 ## Failure Modes
 
@@ -298,8 +425,8 @@ only (Redis round trips plus heartbeats); real workloads will differ.
 ## Limitations
 
 - **No exactly-once.** Delivery is at-least-once: a lease can expire (worker crash, Redis blip, GC pause) and a task can run twice. Handlers must be idempotent.
-- **Single Redis.** No replication, sharding, or failover logic — durability is whatever the Redis deployment provides.
-- **Partial auth.** The HTTP API has JWT + RBAC. The **gRPC gateway and Redis have no authentication or TLS**, and the HTTP API itself is plain HTTP. Do not expose any of it to a public network.
+- **Single Redis.** No replication, sharding, or failover logic — durability is whatever the Redis deployment provides. The bundled Kubernetes manifest runs one AOF-backed Redis on a PersistentVolumeClaim, but that is still a single point of failure.
+- **Partial auth.** The HTTP API has JWT + RBAC, with optional OIDC/SSO login. The **gRPC gateway and Redis have no authentication or TLS**, and the HTTP API itself is plain HTTP. Do not expose any of it to a public network.
 - **No multi-tenancy / queue isolation.** "Queues" are a single logical namespace, not separate Redis keyspaces or broker connections.
 - **Completed bodies are deleted**, so a finished job cannot be looked up by ID afterwards (see the HTTP API note above).
 - **Idle polling** uses a short sleep interval per worker; blocking variants (e.g. `BLMOVE`) are not implemented.
@@ -321,12 +448,13 @@ only (Redis round trips plus heartbeats); real workloads will differ.
 - Prometheus metrics (worker + gateway) and a throughput/stats HTTP API
 - HTTP/JSON control API (pause/resume/purge, retry/requeue/delete, DLQ ops, delayed ops)
 - JWT + RBAC auth for the HTTP API
+- OIDC / SSO login (authorization code + PKCE) with email-based role mapping
 - React + TanStack Start web console with login
 - gRPC load generator
 
 **Planned / explicitly out of scope:**
 - Smarter idle polling (blocking operations)
-- Multi-instance deployment hardening
+- HA Redis (replication/Sentinel) — the Kubernetes manifest runs a single AOF-backed Redis
 - AuthN/AuthZ and multi-tenancy
 - A streaming/Kafka-style log layer (deliberately not pursued — different problem)
 

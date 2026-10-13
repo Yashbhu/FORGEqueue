@@ -5,6 +5,7 @@ import { api } from "@/api/endpoints";
 import { useAction, useBulk, useDlq } from "@/api/queries";
 import { DataTable } from "@/components/data-table";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { Can } from "@/components/can";
 import { BulkBar } from "@/components/job-tables";
 import { JobId, Mono, PageHeader, Section, StatCard, TimeAgo } from "@/components/shared";
 import { FilterSelect, SearchInput, Toolbar } from "@/components/toolbar";
@@ -58,24 +59,26 @@ function DlqPage() {
         title="Dead Letter Queue"
         description="Jobs that exhausted max attempts. Retrying moves them back to their original queue."
         actions={
-          <ConfirmDialog
-            trigger={
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 text-xs text-destructive"
-                disabled={!data?.length}
-              >
-                <Trash2 className="size-3" /> Purge DLQ
-              </Button>
-            }
-            destructive
-            typeToConfirm="purge dlq"
-            title="Purge entire DLQ?"
-            description={`This action cannot be undone. Affected: ${data?.length ?? 0} jobs across ${queues.length} queues.`}
-            confirmLabel="Purge DLQ"
-            onConfirm={() => purge.mutate(undefined)}
-          />
+          <Can perm="dlq:write">
+            <ConfirmDialog
+              trigger={
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs text-destructive"
+                  disabled={!data?.length}
+                >
+                  <Trash2 className="size-3" /> Purge DLQ
+                </Button>
+              }
+              destructive
+              typeToConfirm="purge dlq"
+              title="Purge entire DLQ?"
+              description={`This action cannot be undone. Affected: ${data?.length ?? 0} jobs across ${queues.length} queues.`}
+              confirmLabel="Purge DLQ"
+              onConfirm={() => purge.mutate(undefined)}
+            />
+          </Can>
         }
       />
       <div className="mb-3 grid grid-cols-3 gap-2 md:w-1/2">
@@ -93,26 +96,30 @@ function DlqPage() {
           <FilterSelect label="Queue" value={queue} onChange={setQueue} options={queues} />
         </Toolbar>
         <BulkBar count={sel.size} onClear={() => setSel(new Set())}>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-6 text-xs"
-            onClick={() => (retry.mutate(ids), setSel(new Set()))}
-          >
-            <RotateCcw className="size-3" /> Retry selected
-          </Button>
-          <ConfirmDialog
-            trigger={
-              <Button variant="outline" size="sm" className="h-6 text-xs text-destructive">
-                <Trash2 className="size-3" /> Delete selected
-              </Button>
-            }
-            destructive
-            title={`Delete ${sel.size} DLQ jobs?`}
-            description={`Permanently discards ${sel.size} jobs. They will not be retried.`}
-            confirmLabel={`Delete ${sel.size}`}
-            onConfirm={() => (del.mutate(ids), setSel(new Set()))}
-          />
+          <Can perm="dlq:write">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 text-xs"
+              onClick={() => (retry.mutate(ids), setSel(new Set()))}
+            >
+              <RotateCcw className="size-3" /> Retry selected
+            </Button>
+          </Can>
+          <Can perm="dlq:write">
+            <ConfirmDialog
+              trigger={
+                <Button variant="outline" size="sm" className="h-6 text-xs text-destructive">
+                  <Trash2 className="size-3" /> Delete selected
+                </Button>
+              }
+              destructive
+              title={`Delete ${sel.size} DLQ jobs?`}
+              description={`Permanently discards ${sel.size} jobs. They will not be retried.`}
+              confirmLabel={`Delete ${sel.size}`}
+              onConfirm={() => (del.mutate(ids), setSel(new Set()))}
+            />
+          </Can>
         </BulkBar>
         <DataTable
           rows={rows}
@@ -173,50 +180,52 @@ function DlqPage() {
               header: "Actions",
               align: "right",
               cell: (d) => (
-                <span className="inline-flex gap-0.5">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-6"
-                    aria-label="Retry"
-                    title="Retry"
-                    onClick={() => retry.mutate([d.jobId])}
-                  >
-                    <RotateCcw className="size-3" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-6"
-                    aria-label="Re-enqueue"
-                    title="Re-enqueue (reset attempts)"
-                    onClick={() => retry.mutate([d.jobId])}
-                  >
-                    <Undo2 className="size-3" />
-                  </Button>
-                  <ConfirmDialog
-                    trigger={
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-6 text-destructive"
-                        aria-label="Delete"
-                        title="Delete"
-                      >
-                        <Trash2 className="size-3" />
-                      </Button>
-                    }
-                    destructive
-                    title="Delete DLQ job?"
-                    description={
-                      <>
-                        Permanently discards <code className="font-mono">{d.jobId}</code>.
-                      </>
-                    }
-                    confirmLabel="Delete"
-                    onConfirm={() => del.mutate([d.jobId])}
-                  />
-                </span>
+                <Can perm="dlq:write">
+                  <span className="inline-flex gap-0.5">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-6"
+                      aria-label="Retry"
+                      title="Retry"
+                      onClick={() => retry.mutate([d.jobId])}
+                    >
+                      <RotateCcw className="size-3" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-6"
+                      aria-label="Re-enqueue"
+                      title="Re-enqueue (reset attempts)"
+                      onClick={() => retry.mutate([d.jobId])}
+                    >
+                      <Undo2 className="size-3" />
+                    </Button>
+                    <ConfirmDialog
+                      trigger={
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-6 text-destructive"
+                          aria-label="Delete"
+                          title="Delete"
+                        >
+                          <Trash2 className="size-3" />
+                        </Button>
+                      }
+                      destructive
+                      title="Delete DLQ job?"
+                      description={
+                        <>
+                          Permanently discards <code className="font-mono">{d.jobId}</code>.
+                        </>
+                      }
+                      confirmLabel="Delete"
+                      onConfirm={() => del.mutate([d.jobId])}
+                    />
+                  </span>
+                </Can>
               ),
             },
           ]}

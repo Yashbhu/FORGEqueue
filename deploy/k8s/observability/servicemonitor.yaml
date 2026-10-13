@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: forgequeue
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames: ["forgequeue"]
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["worker", "gateway"]
+  endpoints:
+    - port: metrics
+      interval: 15s

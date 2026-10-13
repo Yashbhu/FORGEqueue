@@ -1,8 +1,5 @@
-// Package metrics wires OpenTelemetry instruments to a Prometheus registry
-// so the queue's behaviour is observable over HTTP.
-//
-// Instruments are always non-nil: a disabled Metrics (via NewNop) still
-// returns valid no-op instruments, so call sites never need nil checks.
+// Package metrics wires OpenTelemetry instruments to a Prometheus registry.
+// Instruments are always non-nil, even when telemetry is disabled.
 package metrics
 
 import (
@@ -20,8 +17,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-// Metrics holds every instrument the queue records into. All fields are
-// usable even when telemetry is disabled; they become no-ops then.
+// Metrics holds every instrument the queue records into. Fields stay usable
+// when telemetry is off, they just become no-ops.
 type Metrics struct {
 	Ready     bool
 	provider  *sdkmetric.MeterProvider
@@ -35,14 +32,8 @@ type Metrics struct {
 	TasksDLQ       metric.Int64Counter
 	LeaseLosses    metric.Int64Counter
 
-	// Queue depths are observable gauges rather than up/down counters.
-	//
-	// An up/down counter needs a matching decrement on every claim, ACK,
-	// promotion, failure and recovery, spread across the gateway and every
-	// worker process. Any missed transition leaves the value permanently
-	// wrong with no way to correct it, and separate processes would each
-	// export their own partial total. Redis already holds the
-	// authoritative depth, so these gauges are sampled from it instead.
+	// Queue depths are gauges sampled from Redis. Up/down counters would
+	// drift, since a missed decrement cannot be corrected.
 	QueueReady     metric.Int64Gauge
 	QueueInflight  metric.Int64Gauge
 	QueueScheduled metric.Int64Gauge
@@ -54,28 +45,25 @@ type Metrics struct {
 	TaskDuration     metric.Float64Histogram
 }
 
-// DefaultLatencyBuckets covers sub-millisecond Redis calls up to ten seconds,
-// which is the range a single claim/ack/heartbeat round trip can occupy.
+// DefaultLatencyBuckets covers redis calls from sub-millisecond up to ten
+// seconds.
 var DefaultLatencyBuckets = []float64{
 	0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 }
 
-// DefaultTaskBuckets spans a no-op handler up to a two minute handler.
+// DefaultTaskBuckets spans a no-op handler up to a long-running one.
 var DefaultTaskBuckets = []float64{
 	0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300,
 }
 
-// New builds the instruments and a private Prometheus registry. Call
-// Handler to expose it, or pass Registry to NewServer.
+// New builds the instruments and a private Prometheus registry.
 func New() (*Metrics, error) {
 	reg := prometheus.NewRegistry()
 
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
-		// Scope and target_info labels are constant for this process and
-		// carry no information a dashboard can use. Dropping them keeps
-		// the series names readable instead of drowning every line in
-		// otel_scope_* boilerplate.
+		// Scope and target_info labels are constant here, so drop them to
+		// keep the series names readable.
 		otelprom.WithoutScopeInfo(),
 		otelprom.WithoutTargetInfo(),
 	)
@@ -205,8 +193,7 @@ func New() (*Metrics, error) {
 	return m, nil
 }
 
-// NewNop returns a Metrics whose instruments record nothing. Useful in tests
-// and anywhere telemetry is not wired up.
+// NewNop returns a Metrics that records nothing.
 func NewNop() *Metrics {
 	meter := noop.NewMeterProvider().Meter("forgequeue")
 	m := &Metrics{latencyBs: DefaultLatencyBuckets, taskBs: DefaultTaskBuckets}
@@ -230,9 +217,7 @@ func NewNop() *Metrics {
 	return m
 }
 
-// QueueDepths is a point-in-time snapshot of how many tasks sit in each
-// queue. Collected by Redis so it reflects every process, not just the one
-// reporting it.
+// QueueDepths is a snapshot of how many tasks sit in each queue.
 type QueueDepths struct {
 	Ready     int64
 	Inflight  int64
@@ -240,11 +225,8 @@ type QueueDepths struct {
 	Dead      int64
 }
 
-// RecordQueueDepths publishes a depth snapshot to the queue gauges.
-//
-// It records the ready queue even when it is empty: a zero is a meaningful
-// value here ("the queue is drained"), and skipping it would leave the last
-// non-zero reading on the dashboard forever.
+// RecordQueueDepths publishes a depth snapshot to the queue gauges. Zero is
+// recorded too, otherwise a drained queue leaves a stale reading behind.
 func (m *Metrics) RecordQueueDepths(ctx context.Context, d QueueDepths) {
 	m.QueueReady.Record(ctx, d.Ready)
 	m.QueueInflight.Record(ctx, d.Inflight)
@@ -252,13 +234,8 @@ func (m *Metrics) RecordQueueDepths(ctx context.Context, d QueueDepths) {
 	m.QueueDLQ.Record(ctx, d.Dead)
 }
 
-// DepthSampler periodically publishes queue depths read from Redis.
-//
-// Both the gateway and the worker can run one: they are separate processes
-// reporting the same shared queues, and each scrape target simply states
-// the current depth. Note that a dashboard should read these with max() or
-// last() rather than sum(), since more than one process may report the same
-// queue.
+// DepthSampler periodically publishes queue depths read from Redis. Both the
+// gateway and workers can run one, so read them with max() not sum().
 type DepthSampler struct {
 	metrics   *Metrics
 	client    redis.Cmdable
@@ -269,11 +246,8 @@ type DepthSampler struct {
 // DefaultDepthInterval is how often a DepthSampler refreshes the gauges.
 const DefaultDepthInterval = 5 * time.Second
 
-// NewDepthSampler returns a sampler reading depths from client.
-//
-// A nil onFailure swallows errors silently, which suits tests. Production
-// callers should log so a broken Redis does not go unnoticed just because
-// the queue-depth panel went flat.
+// NewDepthSampler returns a sampler reading depths from client. A nil
+// onFailure swallows errors, which suits tests.
 func NewDepthSampler(
 	m *Metrics,
 	client redis.Cmdable,
@@ -292,9 +266,8 @@ func NewDepthSampler(
 	}
 }
 
-// Run publishes depths until ctx is cancelled. It publishes once before
-// waiting, so the first scrape does not have to wait a full interval for
-// numbers that are already knowable.
+// Run publishes depths until ctx is cancelled. Publishes once up front so
+// the first scrape does not wait a full interval.
 func (s *DepthSampler) Run(ctx context.Context) {
 	s.Publish(ctx)
 
@@ -312,11 +285,8 @@ func (s *DepthSampler) Run(ctx context.Context) {
 	}
 }
 
-// Publish samples the depths once and records them.
-//
-// On failure the gauges are left untouched. Overwriting them with zero would
-// be actively misleading: an unreachable Redis and a genuinely drained queue
-// are indistinguishable on a dashboard, and only one of them is healthy.
+// Publish samples the depths once and records them. On failure the gauges are
+// left untouched, so an unreachable Redis is not shown as a drained queue.
 func (s *DepthSampler) Publish(ctx context.Context) {
 	depths, err := s.Depths(ctx)
 	if err != nil {
@@ -329,14 +299,9 @@ func (s *DepthSampler) Publish(ctx context.Context) {
 	s.metrics.RecordQueueDepths(ctx, depths)
 }
 
-// Depths reads the current depth of every queue in a single round trip.
-//
-// The four commands are pipelined, so this costs one network round trip
-// rather than four and the numbers come from roughly the same instant.
+// Depths reads the depth of every queue in one pipelined round trip.
 func (s *DepthSampler) Depths(ctx context.Context) (QueueDepths, error) {
-	// A sampler with no client is a wiring mistake. Return an error so the
-	// failure is reported rather than panicking inside the caller's
-	// goroutine, which would take the whole process down.
+	// No client is a wiring mistake. Return an error rather than panic.
 	if s.client == nil {
 		return QueueDepths{}, errors.New("depth sampler has no redis client")
 	}
@@ -360,8 +325,7 @@ func (s *DepthSampler) Depths(ctx context.Context) (QueueDepths, error) {
 	}, nil
 }
 
-// Redis key names holding each queue. Exported so a dashboard config or a
-// test can refer to the same constants the sampler reads.
+// Redis key names holding each queue.
 const (
 	keyReady     = "queue:tasks:immediate"
 	keyInflight  = "queue:tasks:inflight"
@@ -369,8 +333,7 @@ const (
 	keyDead      = "queue:tasks:dead"
 )
 
-// Registry exposes the underlying registry so callers can register extra
-// collectors or serve it themselves.
+// Registry exposes the underlying registry.
 func (m *Metrics) Registry() *prometheus.Registry { return m.registry }
 
 // Handler serves the Prometheus exposition format.
@@ -391,8 +354,7 @@ type Server struct {
 	srv *http.Server
 }
 
-// NewServer returns a server that serves m on addr. A blank addr serves
-// /metrics on :9090.
+// NewServer returns a server serving m on addr. A blank addr uses :9090.
 func NewServer(addr string, m *Metrics) *Server {
 	if addr == "" {
 		addr = ":9090"
@@ -400,6 +362,14 @@ func NewServer(addr string, m *Metrics) *Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
 
 	return &Server{
 		srv: &http.Server{

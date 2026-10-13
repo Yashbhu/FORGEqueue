@@ -3,6 +3,7 @@ import { Pause, Play, Trash2 } from "lucide-react";
 import { api } from "@/api/endpoints";
 import { useAction, useDelayed, useQueue, useQueueJobs, useThroughput } from "@/api/queries";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { Can } from "@/components/can";
 import { DelayedTable, JobsTable } from "@/components/job-tables";
 import { Legend, THROUGHPUT, TimeChart } from "@/components/charts";
 import { EmptyState, Mono, PageHeader, Section, StatCard, StatusBadge } from "@/components/shared";
@@ -59,7 +60,7 @@ function QueueDetail() {
         }
         actions={
           q && (
-            <>
+            <Can perm="queues:write">
               {q.status === "paused" ? (
                 <Button
                   size="sm"
@@ -95,7 +96,7 @@ function QueueDetail() {
                 confirmLabel="Purge pending"
                 onConfirm={() => purge.mutate(queueName)}
               />
-            </>
+            </Can>
           )
         }
       />

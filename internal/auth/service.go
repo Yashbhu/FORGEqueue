@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// ErrInvalidCredentials is returned when a username is unknown or the password
-// does not match. It is deliberately identical in both cases.
+// ErrInvalidCredentials is returned for an unknown username or a bad password.
+// The same error is used for both.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
 // Identity is the authenticated principal attached to a request. Permissions
@@ -77,6 +77,9 @@ func NewService(users []User, secret []byte, ttl time.Duration) (*Service, error
 	}, nil
 }
 
+// HasLocalUsers reports whether any username/password accounts are configured.
+func (s *Service) HasLocalUsers() bool { return s != nil && len(s.users) > 0 }
+
 // Authenticate verifies credentials and returns the resulting identity.
 func (s *Service) Authenticate(username, password string) (Identity, error) {
 	u, ok := s.users[username]
@@ -91,18 +94,33 @@ func (s *Service) IssueToken(id Identity) (string, time.Time, error) {
 	return s.tokens.issue(id.Username, id.Roles)
 }
 
-// VerifyToken validates a bearer token and reconstructs the identity. The user
-// must still exist, so deleting an account revokes its outstanding tokens.
+// VerifyToken validates a bearer token and rebuilds the identity. Local users
+// are re-read so a role change takes effect at once. SSO subjects use the
+// roles embedded in the token.
 func (s *Service) VerifyToken(token string) (Identity, error) {
 	c, err := s.tokens.verify(token)
 	if err != nil {
 		return Identity{}, err
 	}
-	u, ok := s.users[c.Subject]
-	if !ok {
+	if u, ok := s.users[c.Subject]; ok {
+		return s.identityFor(u.Username, u.Roles), nil
+	}
+	roles := make([]Role, 0, len(c.Roles))
+	for _, r := range c.Roles {
+		if ValidRole(Role(r)) {
+			roles = append(roles, Role(r))
+		}
+	}
+	if len(roles) == 0 {
 		return Identity{}, ErrInvalidToken
 	}
-	return s.identityFor(u.Username, u.Roles), nil
+	return s.identityFor(c.Subject, roles), nil
+}
+
+// NewIdentity builds an identity for an externally-authenticated principal
+// such as an SSO login.
+func (s *Service) NewIdentity(username string, roles []Role) Identity {
+	return s.identityFor(username, roles)
 }
 
 func (s *Service) identityFor(username string, roles []Role) Identity {

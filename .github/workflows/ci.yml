@@ -36,3 +36,31 @@ jobs:
       # unless FORGEQUEUE_PG_DSN is set.
       - name: Test
         run: go test ./... -count=1
+
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: apiserver
+            dockerfile: dockerfiles/apiserver.Dockerfile
+          - name: gateway
+            dockerfile: dockerfiles/gateway.Dockerfile
+          - name: worker
+            dockerfile: dockerfiles/worker.Dockerfile
+          - name: web
+            dockerfile: dockerfiles/web.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

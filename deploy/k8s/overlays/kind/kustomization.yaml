@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: forgequeue
+
+resources:
+  - ../../base
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+# Dev-only credentials for the local kind cluster. Never use these in prod.
+secretGenerator:
+  - name: forgequeue-secrets
+    literals:
+      - FORGEQUEUE_AUTH_SECRET=devsecret-change-me
+      - FORGEQUEUE_ADMIN_USER=admin
+      - FORGEQUEUE_ADMIN_PASSWORD=devpassword
+      # Shared by the Postgres StatefulSet (POSTGRES_PASSWORD) and the derived
+      # FORGEQUEUE_PG_DSN that gateway/worker build in the base manifests.
+      - POSTGRES_PASSWORD=devpostgres
+
+images:
+  - name: forgequeue/worker
+    newTag: latest
+  - name: forgequeue/gateway
+    newTag: latest
+  - name: forgequeue/apiserver
+    newTag: latest
+  - name: forgequeue/web
+    newTag: latest

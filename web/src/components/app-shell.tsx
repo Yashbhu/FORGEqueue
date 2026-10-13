@@ -176,7 +176,7 @@ function UserFooter({ collapsed }: { collapsed: boolean }) {
             <div className="truncate text-xs font-medium" title={username}>
               {username}
             </div>
-            <div className="truncate text-[10px] capitalized text-muted-foreground">
+            <div className="truncate text-[10px] capitalize text-muted-foreground">
               {roles.join(", ")}
             </div>
           </div>
@@ -388,6 +388,9 @@ function Topbar({ onToggle, onSearch }: { onToggle: () => void; onSearch: () => 
 
 function CommandPalette({ open, setOpen }: { open: boolean; setOpen: (o: boolean) => void }) {
   const navigate = useNavigate();
+  const session = useSession();
+  const perms = session?.user.permissions ?? [];
+  const nav = visibleNav(NAV, perms);
   const queues = useQueues().data ?? [];
   const workers = useWorkers().data ?? [];
   const dlq = useDlq().data ?? [];
@@ -414,7 +417,7 @@ function CommandPalette({ open, setOpen }: { open: boolean; setOpen: (o: boolean
       <CommandList>
         <CommandEmpty>No results</CommandEmpty>
         <CommandGroup heading="Navigate">
-          {[...NAV, ...SYS].map((n) => (
+          {[...nav, ...SYS].map((n) => (
             <CommandItem
               key={n.to}
               value={`go ${n.label}`}

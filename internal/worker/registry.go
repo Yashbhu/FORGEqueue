@@ -17,10 +17,9 @@ func (wp *WorkerPool) leasesKey() string {
 	return workerMetaPrefix + wp.id + ":leases"
 }
 
-// publishMeta writes the registration document and refreshes its TTL. It is
-// called once on Start and then on every heartbeat tick. Best effort: a
-// failure to publish only hides the worker from the dashboard, it never
-// stops task processing.
+// publishMeta writes the registration document and refreshes its TTL. called
+// on Start and every heartbeat tick. best effort: a failed publish only hides
+// the worker from the dashboard.
 func (wp *WorkerPool) publishMeta() {
 	meta := workerMeta{
 		ID:            wp.id,
@@ -62,7 +61,7 @@ func (wp *WorkerPool) registrationLoop() {
 }
 
 // deregister removes this worker from the registry so a clean shutdown
-// disappears from the dashboard immediately instead of waiting for the TTL.
+// disappears from the dashboard right away instead of waiting for the TTL.
 func (wp *WorkerPool) deregister() {
 	ctx := context.Background()
 	pipe := wp.redisClient.TxPipeline()

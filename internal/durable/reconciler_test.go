@@ -40,7 +40,7 @@ func TestReconcileMaterializesImmediate(t *testing.T) {
 	// Redis is empty (simulates a gateway that journaled a task and then
 	// died before writing to the hot store), so the reconciler must put the
 	// task on the ready list with its body in place.
-	repaired, err := ReconcileOnce(ctx, rdb, p)
+	repaired, _, _, err := ReconcileOnce(ctx, rdb, p, Cursor{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -59,8 +59,17 @@ func TestReconcileMaterializesImmediate(t *testing.T) {
 		t.Fatalf("body = %q, want %q (err=%v)", got, body, err)
 	}
 
-	if pending, _ := p.Pending(ctx); len(pending) != 0 {
-		t.Fatalf("pending has %d task(s) after reconcile, want 0", len(pending))
+	// A second sweep must be a no-op: the task is still non-terminal, but it
+	// is already in Redis so nothing is repaired and no duplicate appears.
+	repaired, _, _, err = ReconcileOnce(ctx, rdb, p, Cursor{})
+	if err != nil {
+		t.Fatalf("reconcile again: %v", err)
+	}
+	if repaired != 0 {
+		t.Fatalf("second sweep repaired = %d, want 0", repaired)
+	}
+	if n, _ := rdb.LLen(ctx, "queue:tasks:immediate").Result(); n != 1 {
+		t.Fatalf("immediate queue has %d item(s) after second sweep, want 1", n)
 	}
 }
 
@@ -79,7 +88,7 @@ func TestReconcileMaterializesDelayed(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 
-	if _, err := ReconcileOnce(ctx, rdb, p); err != nil {
+	if _, _, _, err := ReconcileOnce(ctx, rdb, p, Cursor{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -117,7 +126,7 @@ func TestReconcileSkipsTaskAlreadyInRedis(t *testing.T) {
 		t.Fatalf("lpush: %v", err)
 	}
 
-	repaired, err := ReconcileOnce(ctx, rdb, p)
+	repaired, _, _, err := ReconcileOnce(ctx, rdb, p, Cursor{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -128,9 +137,6 @@ func TestReconcileSkipsTaskAlreadyInRedis(t *testing.T) {
 	// No duplicate was pushed onto the ready list.
 	if n, _ := rdb.LLen(ctx, "queue:tasks:immediate").Result(); n != 1 {
 		t.Fatalf("immediate queue has %d item(s), want 1 (no dupes)", n)
-	}
-	if pending, _ := p.Pending(ctx); len(pending) != 0 {
-		t.Fatalf("pending has %d task(s), want 0 after reconcile", len(pending))
 	}
 }
 
@@ -143,17 +149,19 @@ func TestReconcileRebuildsAfterRedisWipe(t *testing.T) {
 	id := "rec-wipe"
 	body := []byte(`{"id":"rec-wipe","task_type":"noop"}`)
 
-	// A worker claimed this task and journaled it as processing, then the
-	// Redis instance lost everything. The reconciler must bring it back and
-	// schedule it for a re-run (past-now score), like recovery would.
+	// A worker claimed and materialized this task (so redis_pending is
+	// already FALSE), then Redis lost everything. Because the reconciler
+	// re-verifies every non-terminal task, not just redis_pending rows, it
+	// must bring the task back and schedule it for a re-run (past-now score),
+	// like recovery would.
 	if _, err := p.pool.Exec(ctx, `
 		INSERT INTO queue_tasks (id, task_type, payload, max_retries, attempts, state, redis_pending)
-		VALUES ($1, 'noop', $2, 3, 1, 'processing', TRUE)
+		VALUES ($1, 'noop', $2, 3, 1, 'processing', FALSE)
 	`, id, body); err != nil {
 		t.Fatalf("seed processing row: %v", err)
 	}
 
-	if _, err := ReconcileOnce(ctx, rdb, p); err != nil {
+	if _, _, _, err := ReconcileOnce(ctx, rdb, p, Cursor{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 

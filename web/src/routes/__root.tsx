@@ -128,7 +128,8 @@ function RedirectToLogin() {
     navigate({ to: "/login", replace: true });
   }, [navigate]);
   return (
-    <div className="flex min-h-screen items-center justify-center text-xs text-muted-foreground">
+    <div className="flex min-h-screen items-center justify-center gap-2 text-xs text-muted-foreground">
+      <span className="size-3 animate-spin rounded-full border border-current border-t-transparent" />
       Redirecting to sign in…
     </div>
   );

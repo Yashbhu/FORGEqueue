@@ -55,26 +55,28 @@ func TestPostgresLifecycle(t *testing.T) {
 	id := "life-1"
 	body := []byte(`{"id":"life-1","task_type":"noop"}`)
 
-	// Enqueue leaves redis_pending = true so the reconciler can prove it.
+	// Enqueue leaves the task non-terminal, so the reconciler sees it.
 	if err := p.Enqueue(ctx, Task{
 		ID: id, TaskType: "noop", Payload: body, State: StateEnqueued,
 	}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	pending, err := p.Pending(ctx)
+	active, err := p.Active(ctx, Cursor{}, 100)
 	if err != nil {
-		t.Fatalf("pending: %v", err)
+		t.Fatalf("active: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != id || pending[0].ScheduleAt != (time.Time{}) {
-		t.Fatalf("pending = %+v, want one immediate task %s", pending, id)
+	if len(active) != 1 || active[0].ID != id || active[0].ScheduleAt != (time.Time{}) {
+		t.Fatalf("active = %+v, want one immediate task %s", active, id)
 	}
 
-	// Materialized proves Redis has it -> no longer pending.
+	// Materialized clears the redis_pending hint, but the task is still
+	// non-terminal and must keep being re-verified: that is what lets the
+	// reconciler rebuild Redis after a flush.
 	if err := p.Materialized(ctx, id); err != nil {
 		t.Fatalf("materialized: %v", err)
 	}
-	if pending, _ := p.Pending(ctx); len(pending) != 0 {
-		t.Fatalf("pending has %d task(s) after materialized, want 0", len(pending))
+	if active, _ := p.Active(ctx, Cursor{}, 100); len(active) != 1 {
+		t.Fatalf("active has %d task(s) after materialized, want 1", len(active))
 	}
 
 	// The journal follows the worker's view: processing -> retrying -> done.
@@ -99,9 +101,9 @@ func TestPostgresLifecycle(t *testing.T) {
 		t.Fatalf("state = %s, want succeeded", st)
 	}
 
-	// A terminal state must never surface as pending.
-	if pending, _ := p.Pending(ctx); len(pending) != 0 {
-		t.Fatalf("pending has %d task(s) after terminal state, want 0", len(pending))
+	// A terminal state must never surface as active.
+	if active, _ := p.Active(ctx, Cursor{}, 100); len(active) != 0 {
+		t.Fatalf("active has %d task(s) after terminal state, want 0", len(active))
 	}
 }
 
@@ -130,11 +132,45 @@ func TestPostgresEnqueueIsUpsert(t *testing.T) {
 		t.Fatalf("query: %v", err)
 	}
 
-	pending, _ := p.Pending(ctx)
-	if len(pending) != 1 {
-		t.Fatalf("pending has %d task(s), want 1", len(pending))
+	active, _ := p.Active(ctx, Cursor{}, 100)
+	if len(active) != 1 {
+		t.Fatalf("active has %d task(s), want 1", len(active))
 	}
 	if state != string(StateEnqueued) {
 		t.Fatalf("state = %s, want enqueued", state)
+	}
+}
+
+// Active must walk rows in keyset order so a sweep can page through a large
+// active set without re-reading or skipping rows.
+func TestPostgresActivePaginates(t *testing.T) {
+	p := newTestDB(t)
+	truncateTasks(t, p)
+	ctx := context.Background()
+
+	for _, id := range []string{"page-1", "page-2", "page-3"} {
+		if err := p.Enqueue(ctx, Task{
+			ID: id, TaskType: "noop", Payload: []byte(`{}`), State: StateEnqueued,
+		}); err != nil {
+			t.Fatalf("enqueue %s: %v", id, err)
+		}
+	}
+
+	var seen []string
+	cursor := Cursor{}
+	for {
+		page, err := p.Active(ctx, cursor, 1)
+		if err != nil {
+			t.Fatalf("active: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = append(seen, page[0].ID)
+		cursor = Cursor{CreatedAt: page[0].CreatedAt, ID: page[0].ID}
+	}
+
+	if len(seen) != 3 {
+		t.Fatalf("paged over %v, want all 3 tasks", seen)
 	}
 }

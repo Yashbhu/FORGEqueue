@@ -41,7 +41,7 @@ spec:
             matchExpressions:
               - key: app.kubernetes.io/name
                 operator: In
-                values: ["gateway", "worker"]
+                values: ["gateway", "worker", "postgres-backup"]
       ports:
         - protocol: TCP
           port: 5432

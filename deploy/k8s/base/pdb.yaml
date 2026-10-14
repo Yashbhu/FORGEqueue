@@ -1,6 +1,20 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+spec:
+  # A single-replica datastore: block voluntary disruptions rather than let a
+  # node drain take the journal down without a human deciding to.
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
   name: worker
   labels:
     app.kubernetes.io/part-of: forgequeue

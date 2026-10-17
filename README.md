@@ -137,6 +137,27 @@ be the accurate signal. Metrics are scraped via the `ServiceMonitor` in
 kube-prometheus-stack (the `monitoring.coreos.com` CRDs must exist). The Ingress
 targets the `forgequeue.local` host and needs an ingress-nginx controller.
 
+Launch hardening baked into the manifests:
+
+- **TLS at the edge.** The Ingress terminates TLS (cert-manager
+  `letsencrypt-prod` by default) and redirects HTTP to HTTPS; the console and
+  `/api` share one origin, so the API needs no CORS grant in production.
+- **Redis AUTH.** The Redis StatefulSet runs with `requirepass` sourced from
+  `forgequeue-secrets` (`FORGEQUEUE_REDIS_PASSWORD`); every service reads it
+  through `redisutil`. `maxmemory-policy noeviction` bounds memory without
+  silently dropping queued tasks.
+- **Alerting.** `observability/prometheusrule.yaml` ships alerts for backlog
+  growth, dead-lettering, lease losses, a down scrape target, failed backups
+  and filling persistent volumes.
+- **Queue-depth autoscaling.** `observability/keda-scaledobject.yaml` scales
+  workers on the ready-list length (KEDA); it supersedes the CPU HPA.
+- **Off-cluster backups.** `base/backup.yaml` adds a daily `pg_dump` to object
+  storage in addition to the on-PVC copy, and no-ops when unconfigured.
+
+Images are built and signed (SBOM + provenance + cosign) by
+`.github/workflows/release.yml` on a `v*` tag. Pin the printed digests in
+`overlays/prod` before deploying.
+
 ## Architecture
 
 ForgeQueue consists of two main components that communicate through Redis:
@@ -279,6 +300,16 @@ The batch's heartbeats are only stopped **after** the ACK/requeue is committed. 
 | Setting | Location | Default |
 | --- | --- | --- |
 | Redis address | `FORGEQUEUE_REDIS_ADDR` | `localhost:6379` |
+| Redis password (AUTH) | `FORGEQUEUE_REDIS_PASSWORD` | none |
+| Redis database index | `FORGEQUEUE_REDIS_DB` | `0` |
+| Redis TLS | `FORGEQUEUE_REDIS_TLS` | off |
+| Redis TLS verify skip (dev) | `FORGEQUEUE_REDIS_TLS_INSECURE` | off |
+| Redis TLS CA bundle | `FORGEQUEUE_REDIS_TLS_CA` | system roots |
+| gRPC TLS cert / key | `FORGEQUEUE_GRPC_TLS_CERT` / `_KEY` | off (plaintext) |
+| gRPC TLS client CA (mTLS) | `FORGEQUEUE_GRPC_TLS_CLIENT_CA` | off |
+| API CORS origins (comma list) | `FORGEQUEUE_CORS_ORIGINS` | same-origin only |
+| API max request body | `FORGEQUEUE_MAX_BODY_BYTES` | 1 MiB |
+| Postgres sslmode (DSN) | `FORGEQUEUE_PG_SSLMODE` | `disable` |
 | Gateway gRPC listen | `gateway.Start()` (hardcoded) | `:50051` |
 | Gateway metrics address | `FORGEQUEUE_METRICS_ADDR` | disabled |
 | HTTP API listen | `FORGEQUEUE_API_ADDR` | `:8080` |
@@ -426,7 +457,13 @@ Real handlers dominate throughput in practice, so treat these as an upper bound.
 
 - **No exactly-once.** Delivery is at-least-once: a lease can expire (worker crash, Redis blip, GC pause) and a task can run twice. Handlers must be idempotent.
 - **Single Redis.** No replication, sharding, or failover logic — durability is whatever the Redis deployment provides. The bundled Kubernetes manifest runs one AOF-backed Redis on a PersistentVolumeClaim, but that is still a single point of failure.
-- **Partial auth.** The HTTP API has JWT + RBAC, with optional OIDC/SSO login. The **gRPC gateway and Redis have no authentication or TLS**, and the HTTP API itself is plain HTTP. Do not expose any of it to a public network.
+- **Partial auth.** The HTTP API and the gRPC gateway authenticate with JWT
+  bearer tokens (RBAC on the API, per-method permissions on gRPC), with
+  optional OIDC/SSO login. Transport TLS is available but **off by default**:
+  enable it on gRPC with the `FORGEQUEUE_GRPC_TLS_*` vars and terminate HTTP
+  TLS at the ingress (see the Kubernetes section). Redis supports
+  `requirepass` and TLS through its env vars. On a trusted pod network the
+  defaults are plaintext; do not expose any port publicly without enabling TLS.
 - **No multi-tenancy / queue isolation.** "Queues" are a single logical namespace, not separate Redis keyspaces or broker connections.
 - **Completed bodies are deleted**, so a finished job cannot be looked up by ID afterwards (see the HTTP API note above).
 - **Idle polling** uses a short sleep interval per worker; blocking variants (e.g. `BLMOVE`) are not implemented.

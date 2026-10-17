@@ -27,3 +27,12 @@ configMapGenerator:
       - FORGEQUEUE_BATCH_SIZE=1
       - FORGEQUEUE_METRICS_ADDR=:9100
       - FORGEQUEUE_API_ADDR=:8080
+      # TLS mode for the Postgres connection. "disable" fits the bundled,
+      # in-cluster Postgres (loopback pod network). Override to "require" or
+      # "verify-full" in an overlay that points at a managed, TLS-terminating
+      # Postgres (close FORGEQUEUE_PG_DSN accordingly).
+      - FORGEQUEUE_PG_SSLMODE=disable
+      # Browser origins allowed to call the API with credentials. Empty means
+      # same-origin only (the ingress serves the console and /api together),
+      # which is the production shape. Dev sets the web origin explicitly.
+      - FORGEQUEUE_CORS_ORIGINS=

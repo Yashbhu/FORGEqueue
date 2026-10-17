@@ -12,6 +12,8 @@ COPY web/ ./
 # web origin and the ingress can route /api to the apiserver service.
 ARG VITE_API_BASE_URL=/api
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ARG VITE_APP_VERSION=v1.0.0
+ENV VITE_APP_VERSION=$VITE_APP_VERSION
 ENV NITRO_PRESET=node-server
 RUN bun run build
 

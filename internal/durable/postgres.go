@@ -12,10 +12,13 @@ import (
 // Override with FORGEQUEUE_PG_DSN.
 const DefaultDSN = "postgres://localhost:5432/forgequeue"
 
-// One table, one row per enqueued task, following it until succeeded or dead.
-// payload is BYTEA not JSONB: it is the exact body Redis stores, so the
-// reconciler can rebuild Redis without re-encoding.
-const schema = `
+// Migration 1: one table, one row per enqueued task, following it until
+// succeeded or dead. payload is BYTEA not JSONB: it is the exact body Redis
+// stores, so the reconciler can rebuild Redis without re-encoding.
+//
+// Every statement is idempotent (IF NOT EXISTS) so a database created by an
+// older binary, before this file tracked versions, adopts cleanly.
+const migration1QueueTasks = `
 CREATE TABLE IF NOT EXISTS queue_tasks (
     id            TEXT PRIMARY KEY,
     task_type     TEXT NOT NULL,
@@ -38,18 +41,42 @@ CREATE INDEX IF NOT EXISTS queue_tasks_active_idx
 DROP INDEX IF EXISTS queue_tasks_pending_idx;
 `
 
+// migrations is the ordered, append-only list of schema changes. To evolve the
+// schema, add the next version here; never edit an applied one. Each runs
+// exactly once and is recorded in schema_migrations.
+var migrations = []migration{
+	{Version: 1, Name: "queue_tasks", SQL: migration1QueueTasks},
+}
+
+type migration struct {
+	Version int
+	Name    string
+	SQL     string
+}
+
+// migrationsTable records which migrations have run. It is created before any
+// migration so the very first one is tracked too.
+const migrationsTable = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
 // Postgres is a Store backed by PostgreSQL.
 type Postgres struct {
 	pool *pgxpool.Pool
 }
 
-// NewPostgres connects to Postgres and makes sure the schema exists. Returns
-// an error if Postgres is unreachable.
-// advisoryLock serializes one-time schema creation across pods. Multiple
-// replicas (gateway + workers) all call NewPostgres on boot, and executing the
-// same CREATE/INDEX DDL concurrently raises transient catalog races (e.g.
-// duplicate key on pg_type_typname_nsp_index). The lock is transaction-scoped,
-// so it releases when the commit ends.
+// NewPostgres connects to Postgres, applies any pending migrations, and returns
+// the store. Returns an error if Postgres is unreachable.
+//
+// advisoryLock serializes migrations across pods. Multiple replicas (gateway +
+// workers) all call NewPostgres on boot, and executing the same DDL
+// concurrently raises transient catalog races (e.g. duplicate key on
+// pg_type_typname_nsp_index). The lock is transaction-scoped, so it releases
+// when the commit ends.
 const advisoryLock int64 = 884422
 
 func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
@@ -61,20 +88,57 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 		pool.Close()
 		return nil, fmt.Errorf("durable: ping postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
-		// A concurrent peer may be mid-migration (gateway and workers all
-		// initialize on boot). Retry a few times before giving up.
-		if err := ensureSchema(ctx, pool); err != nil {
-			pool.Close()
-			return nil, fmt.Errorf("durable: ensure schema: %w", err)
-		}
+	if err := migrate(ctx, pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("durable: migrate: %w", err)
 	}
 	return &Postgres{pool: pool}, nil
 }
 
-func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
+// migrate creates the ledger, then applies every migration that has not run,
+// in order, each guarded by an advisory lock. A transient failure (a peer
+// mid-migration) is retried a few times before giving up.
+func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
+		if err := migrateOnce(ctx, pool); err != nil {
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func migrateOnce(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, migrationsTable); err != nil {
+		return err
+	}
+
+	// Which migrations are already applied?
+	applied := map[int]bool{}
+	rows, err := pool.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, m := range migrations {
+		if applied[m.Version] {
+			continue
+		}
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
@@ -83,15 +147,33 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			tx.Rollback(ctx)
 			return err
 		}
-		if _, err := tx.Exec(ctx, schema); err != nil {
+		// Re-check under the lock: a peer may have applied it while we waited.
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`,
+			m.Version).Scan(&exists); err != nil {
 			tx.Rollback(ctx)
-			lastErr = err
-			time.Sleep(200 * time.Millisecond)
+			return err
+		}
+		if exists {
+			tx.Rollback(ctx)
 			continue
 		}
-		return tx.Commit(ctx)
+		if _, err := tx.Exec(ctx, m.SQL); err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
+			m.Version, m.Name); err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
 	}
-	return lastErr
+	return nil
 }
 
 func (p *Postgres) Close() error {

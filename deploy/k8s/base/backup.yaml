@@ -1,6 +1,6 @@
-# Logical backup of the durable journal. This is the pattern, not full DR:
-# a PVC-backed dump protects against operator error and logical corruption,
-# but lives on the same cluster as the data. For real disaster recovery point
+# Logical backup of the durable journal. This is a pattern, not full DR: a
+# PVC-backed dump protects against operator error and logical corruption, but
+# it lives on the same cluster as the data. For real disaster recovery, point
 # the dump destination at object storage (S3/GCS) or ship the base volume
 # snapshots off-cluster. WAL archiving (pgBackRest/WAL-G) is the step beyond
 # this that gives point-in-time recovery.
@@ -89,5 +89,163 @@ spec:
             - name: backups
               persistentVolumeClaim:
                 claimName: postgres-backup
+            - name: tmp
+              emptyDir: {}
+---
+# Off-cluster copy. The PVC dump above lives on the same cluster as the data,
+# so it protects against operator error but not against losing the cluster.
+# This job streams the same logical dump to object storage, which is the copy
+# that actually restores you after a region/cluster loss.
+#
+# Self-guarding: if FORGEQUEUE_BACKUP_BUCKET (and credentials) are absent from
+# the forgequeue-secrets Secret, the job logs and exits 0 instead of failing,
+# so it is harmless in clusters that only want the on-PVC backup.
+#
+# To enable, add to forgequeue-secrets:
+#   FORGEQUEUE_BACKUP_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+#   AWS_DEFAULT_REGION (optional FORGEQUEUE_BACKUP_PREFIX)
+# Prefer a scoped IAM user, or swap the static keys for IRSA/Workload Identity.
+#
+# This is still logical DR, not point-in-time recovery: for PITR add WAL
+# archiving (pgBackRest or WAL-G) to the object store as well.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup-offsite
+  labels:
+    app.kubernetes.io/name: postgres-backup-offsite
+    app.kubernetes.io/part-of: forgequeue
+spec:
+  schedule: "30 3 * * *" # 03:30 daily, after the on-cluster dump
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup-offsite
+            app.kubernetes.io/part-of: forgequeue
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: dump
+              image: postgres:16.15
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: POSTGRES_PASSWORD
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  pg_dump -h postgres -U forgequeue -d forgequeue \
+                    --format=custom --no-owner --no-privileges \
+                    -f /dump/forgequeue.dump
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: dump
+                  mountPath: /dump
+                - name: tmp
+                  mountPath: /tmp
+          containers:
+            - name: upload
+              image: amazon/aws-cli:2.17.0
+              # aws-cli wants a writable HOME; the root filesystem is read-only.
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: FORGEQUEUE_BACKUP_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: FORGEQUEUE_BACKUP_BUCKET
+                      optional: true
+                - name: FORGEQUEUE_BACKUP_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: FORGEQUEUE_BACKUP_PREFIX
+                      optional: true
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: AWS_ACCESS_KEY_ID
+                      optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: AWS_SECRET_ACCESS_KEY
+                      optional: true
+                - name: AWS_DEFAULT_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: forgequeue-secrets
+                      key: AWS_DEFAULT_REGION
+                      optional: true
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  if [ -z "${FORGEQUEUE_BACKUP_BUCKET:-}" ]; then
+                    echo "FORGEQUEUE_BACKUP_BUCKET unset; skipping offsite upload"
+                    exit 0
+                  fi
+                  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                  prefix="${FORGEQUEUE_BACKUP_PREFIX:-forgequeue}"
+                  aws s3 cp /dump/forgequeue.dump \
+                    "s3://${FORGEQUEUE_BACKUP_BUCKET}/${prefix}/forgequeue-${stamp}.dump"
+                  echo "uploaded forgequeue-${stamp}.dump"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+              volumeMounts:
+                - name: dump
+                  mountPath: /dump
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: dump
+              emptyDir: {}
             - name: tmp
               emptyDir: {}

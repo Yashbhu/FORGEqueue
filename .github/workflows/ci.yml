@@ -5,6 +5,11 @@ on:
     branches: [main, master]
   pull_request:
 
+# A newer push to the same branch cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
@@ -34,8 +39,28 @@ jobs:
 
       # Redis is provided above; tests that need Postgres skip automatically
       # unless FORGEQUEUE_PG_DSN is set.
-      - name: Test
-        run: go test ./... -count=1
+      - name: Test (race)
+        run: go test ./... -race -count=1
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # only-new-issues keeps the gate useful without failing on pre-existing
+      # style debt; tighten by removing it once the tree is clean.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          only-new-issues: true
 
   images:
     runs-on: ubuntu-latest
@@ -62,5 +87,70 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
+          load: true
+          tags: forgequeue/${{ matrix.name }}:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan ${{ matrix.name }} image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: forgequeue/${{ matrix.name }}:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: images
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build images
+        run: |
+          for svc in apiserver gateway worker web; do
+            docker build -f "dockerfiles/${svc}.Dockerfile" -t "forgequeue/${svc}:latest" .
+          done
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: forgequeue
+          config: deploy/k8s/kind-config.yaml
+
+      - name: Load images
+        run: |
+          kind load docker-image --name forgequeue \
+            forgequeue/apiserver:latest forgequeue/gateway:latest \
+            forgequeue/worker:latest forgequeue/web:latest
+
+      - name: Deploy
+        run: kubectl apply -k deploy/k8s/overlays/kind
+
+      - name: Wait for rollouts
+        run: |
+          kubectl -n forgequeue rollout status statefulset/redis --timeout=180s
+          kubectl -n forgequeue rollout status statefulset/postgres --timeout=180s
+          kubectl -n forgequeue rollout status deployment/gateway --timeout=180s
+          kubectl -n forgequeue rollout status deployment/apiserver --timeout=180s
+          kubectl -n forgequeue rollout status deployment/worker --timeout=180s
+          kubectl -n forgequeue rollout status deployment/web --timeout=180s
+
+      - name: Smoke test the API
+        run: |
+          kubectl -n forgequeue port-forward svc/apiserver 8080:8080 &
+          PF_PID=$!
+          trap 'kill $PF_PID' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then exit 0; fi
+            sleep 2
+          done
+          echo "apiserver never became healthy" >&2
+          kubectl -n forgequeue get pods
+          exit 1

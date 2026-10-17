@@ -1,8 +1,8 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+# A control-plane plus one worker. No host mounts: manifests are applied with
+# `kubectl apply -k`, so nothing needs to be bind-mounted into the node, and
+# the file stays portable across machines and CI.
 nodes:
-- role: control-plane
-  extraMounts:
-  - hostPath: /Users/yashbahuguna/forgequeue/deploy/k8s
-    containerPath: /etc/k8s-manifests
-- role: worker
+  - role: control-plane
+  - role: worker

@@ -1,0 +1,48 @@
+# Queue-depth autoscaling for workers. The CPU HPA in base/ scales on polling
+# overhead, which is the wrong signal for an idle-polling worker; this scales
+# on the ready-list length instead.
+#
+# Requires KEDA (both the keda.sh CRDs and its operator):
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm upgrade --install keda kedacore/keda -n keda --create-namespace
+#
+# IMPORTANT: KEDA and the CPU HorizontalPodAutoscaler both target the worker
+# Deployment. Applying this file starts a fight over replica count. When you
+# enable KEDA, remove the worker HPA from base/hpa.yaml (drop worker from the
+# document, or delete it from the overlay).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  # Wait out a burst without thrashing; queues tolerate brief over-provision.
+  cooldownPeriod: 120
+  pollingInterval: 15
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: queue:tasks:immediate
+        # One worker replica per 100 ready tasks.
+        listLength: "100"
+        enableTLS: "false"
+      authenticationRef:
+        name: keda-redis-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-redis-auth
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: forgequeue-secrets
+      key: FORGEQUEUE_REDIS_PASSWORD

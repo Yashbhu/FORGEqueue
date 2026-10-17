@@ -7,9 +7,21 @@ resources:
   - ../../base
 
 # forgequeue-secrets is applied out of band (SOPS + age), not generated here.
-# It MUST include FORGEQUEUE_AUTH_SECRET, FORGEQUEUE_ADMIN_USER/PASSWORD, and
-# POSTGRES_PASSWORD (the base derives FORGEQUEUE_PG_DSN from it). For an
-# external managed Postgres, override FORGEQUEUE_PG_DSN in the secret too.
+# It MUST include FORGEQUEUE_AUTH_SECRET, FORGEQUEUE_ADMIN_USER/PASSWORD,
+# FORGEQUEUE_REDIS_PASSWORD, and POSTGRES_PASSWORD (the base derives
+# FORGEQUEUE_PG_DSN from it). For an external managed Postgres, override
+# FORGEQUEUE_PG_DSN in the secret too.
+#
+# Recommended next steps for a real launch:
+#   * Pin images by digest, not the mutable :v1.0.0 tag. The release workflow
+#     prints the digest for each image; copy it here, e.g.
+#     newName: ghcr.io/...-apiserver@sha256:...
+#   * If your packages are private, enable the imagePullSecret patch:
+#       patches:
+#         - path: imagepullsecret-patch.yaml
+#   * When pointing at a TLS-terminating managed Postgres, also set
+#     FORGEQUEUE_PG_SSLMODE=verify-full via a configMapGenerator override so
+#     the derived DSN requires TLS.
 
 images:
   - name: forgequeue/worker

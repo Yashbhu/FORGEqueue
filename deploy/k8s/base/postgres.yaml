@@ -8,8 +8,8 @@ metadata:
 spec:
   serviceName: postgres
   replicas: 1
-  # Keep the journal volume on delete and on scale-down so a StatefulSet
-  # change can never silently orphan or drop the only durable copy.
+  # Retain the data volume on delete and on scale-down. This is the only
+  # durable copy, so we don't want a StatefulSet change dropping it.
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
     whenScaled: Retain
@@ -41,8 +41,8 @@ spec:
                 secretKeyRef:
                   name: forgequeue-secrets
                   key: POSTGRES_PASSWORD
-            # Keep the cluster data in a subdir so the volume root can hold the
-            # lost+found directory some CSI drivers create.
+            # Data goes in a subdir so the volume root can hold lost+found,
+            # which some CSI drivers create.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           ports:
@@ -55,10 +55,9 @@ spec:
             readOnlyRootFilesystem: true
             seccompProfile:
               type: RuntimeDefault
-          # A generous startupProbe absorbs first-boot initdb and crash
-          # recovery. Liveness only begins once the database accepts
-          # connections, so a slow disk cannot trigger a restart loop that
-          # leaves PGDATA half-initialized.
+          # Generous startupProbe for first-boot initdb and crash recovery.
+          # Liveness only starts after the DB accepts connections, so a slow
+          # disk can't restart-loop us into a half-initialized PGDATA.
           startupProbe:
             exec:
               command: ["pg_isready", "-U", "forgequeue", "-d", "forgequeue"]

@@ -2,6 +2,9 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
 	"forgequeue/internal/auth"
@@ -56,6 +60,49 @@ func (s *server) EnqueueTask(
 		Status:    "QUEUED",
 		Timestamp: time.Now().Unix(),
 	}, nil
+}
+
+// serverTLSOption builds gRPC transport credentials from the environment.
+// Returns (nil, nil) when TLS is not configured, so the gateway still runs
+// plaintext on a trusted pod network for local development.
+//
+//	FORGEQUEUE_GRPC_TLS_CERT       server certificate (PEM)
+//	FORGEQUEUE_GRPC_TLS_KEY        server private key (PEM)
+//	FORGEQUEUE_GRPC_TLS_CLIENT_CA  optional CA bundle; when set, clients must
+//	                               present a certificate signed by it (mTLS)
+func serverTLSOption() (grpc.ServerOption, error) {
+	certFile := os.Getenv("FORGEQUEUE_GRPC_TLS_CERT")
+	keyFile := os.Getenv("FORGEQUEUE_GRPC_TLS_KEY")
+	if certFile == "" && keyFile == "" {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("both FORGEQUEUE_GRPC_TLS_CERT and FORGEQUEUE_GRPC_TLS_KEY must be set")
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load key pair: %w", err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	if caFile := os.Getenv("FORGEQUEUE_GRPC_TLS_CLIENT_CA"); caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read client CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates parsed from %s", caFile)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return grpc.Creds(credentials.NewTLS(cfg)), nil
 }
 
 // raw netowrk listener socket opening
@@ -126,9 +173,16 @@ func Start() {
 	}
 
 	//Initialize the core gRPC microservice server container
-	grpcServer := grpc.NewServer(
+	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(newAuthInterceptor(authSvc)),
-	)
+	}
+	if tlsOpt, err := serverTLSOption(); err != nil {
+		log.Fatalf("failed to configure gRPC TLS: %v", err)
+	} else if tlsOpt != nil {
+		opts = append(opts, tlsOpt)
+		log.Println("gRPC TLS enabled on port :50051")
+	}
+	grpcServer := grpc.NewServer(opts...)
 
 	//Register our server implementation with the gRPC engine
 	queuev1.RegisterQueueServiceServer(

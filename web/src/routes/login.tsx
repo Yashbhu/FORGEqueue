@@ -91,7 +91,7 @@ function LoginPage() {
 
   const apiBase = getPrefs().apiBase;
   const env = apiBase.startsWith("/") ? "local-dev" : apiBase.replace(/^https?:\/\//, "");
-  const version = import.meta.env["VITE_APP_VERSION"] || "v0.9.1";
+  const version = import.meta.env["VITE_APP_VERSION"] || "dev";
 
   useEffect(() => {
     if (session) navigate({ to: "/", replace: true });

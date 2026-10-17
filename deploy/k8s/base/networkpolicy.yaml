@@ -1,4 +1,4 @@
-# Redis holds live queue state, so only the queue services may reach it. This
+# Redis holds live queue state, so only the queue services can reach it. This
 # is the network half of the boundary; the gRPC gateway adds token auth on top.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

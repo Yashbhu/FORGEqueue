@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"forgequeue/internal/auth"
+	"forgequeue/internal/version"
 )
 
 type Handler struct {
@@ -713,7 +714,11 @@ func (h *Handler) Throughput(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, points)
 }
 func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
-	h.writeJSON(w, http.StatusOK, map[string]string{"version": "v0.9.1"})
+	h.writeJSON(w, http.StatusOK, map[string]string{
+		"version": version.Version,
+		"commit":  version.Commit,
+		"date":    version.Date,
+	})
 }
 
 func genSeries(rangeQ string, rdb *redis.Client, ctx context.Context) []ThroughputPoint {

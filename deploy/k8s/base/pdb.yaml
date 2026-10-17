@@ -47,3 +47,15 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: apiserver
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web

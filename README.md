@@ -4,14 +4,6 @@ ForgeQueue is a Redis-backed task queue written in Go. It implements durable,
 at-least-once task execution with leases, heartbeats, crash recovery, and
 ownership fencing from first principles.
 
-> **What this is.** A learning / portfolio project that implements a task queue
-> the way a real one works: atomic Lua state transitions, lease ownership,
-> heartbeats, recovery, retries and a dead-letter queue. It is deliberately
-> small and readable rather than production-hardened. It is **not** a drop-in
-> replacement for Redis-backed job systems like Asynq, Celery, BullMQ or
-> Sidekiq — see [Limitations](#limitations) for the honest list of what it does
-> not do.
-
 Key features:
 - At-least-once execution with lease-based ownership and fencing
 - Automatic retries with exponential backoff

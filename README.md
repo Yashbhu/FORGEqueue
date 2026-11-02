@@ -341,6 +341,52 @@ The batch's heartbeats are only stopped **after** the ACK/requeue is committed. 
 | Backoff base | `wp.backoffBase` (unexported) | 1s |
 | Backoff cap | `wp.backoffCap` (unexported) | 60s |
 
+## Observability
+
+The gateway and worker each expose Prometheus metrics at `/metrics` on
+`FORGEQUEUE_METRICS_ADDR` (disabled by default). They are scraped as two
+separate jobs so "accepted" (gateway) and "executed" (worker) stay
+distinguishable:
+
+- `forgequeue_tasks_enqueued_total` — tasks the gateway accepted
+- `forgequeue_tasks_processed_total` — tasks the worker ACKed
+- `forgequeue_tasks_retried_total` / `forgequeue_tasks_dead_lettered_total`
+- `forgequeue_queue_ready / inflight / scheduled / dead` — queue depth by state, sampled from Redis every 5s (O(1) per scrape)
+- `forgequeue_task_duration_seconds` — handler duration histogram (p50/p95/p99)
+- `forgequeue_redis_claim/ack/heartbeat_seconds` — Redis round-trip histograms
+- `forgequeue_lease_losses_total` — fenced lease losses
+
+Run the whole telemetry stack locally with `deploy/observability.sh` (needs
+`prometheus` on PATH; Grafana is optional and only started if installed):
+
+```bash
+./deploy/observability.sh
+# in another terminal, generate some load:
+go run ./cmd/demoenqueue
+```
+
+That prints the URLs: gateway `:9090/metrics`, worker `:9091/metrics`,
+Prometheus UI on `:9095`, and Grafana on `:3000` (no login) when available.
+Logs go to `/tmp/fq-*.log`.
+
+### Kubernetes
+
+Under `deploy/k8s/observability` (applied separately after kube-prometheus-stack, since its CRDs must exist):
+
+- `servicemonitor.yaml` — scrapes the `worker` and `gateway` `metrics` ports every 15s
+- `prometheusrule.yaml` — alerts for backlog growth, dead-lettering, lease losses, a down scrape target, failed backups and filling persistent volumes
+- `keda-scaledobject.yaml` — scales workers on ready-list length; supersedes the CPU HPA in `base/`
+
+### Grafana
+
+Dashboards live under `deploy/grafana`:
+
+- `dashboards/forgequeue.json` — "ForgeQueue Overview": enqueued/processed/retried/dead-lettered stats, queue depth by state, in-flight vs ready, handler duration p50/p95/p99, Redis round trips p95, lease losses, and enqueued vs processed throughput
+- `provisioning/datasources/prometheus.yml` — provisions the Prometheus datasource (`uid: forgequeue`, `http://localhost:9095`) so the dashboard wires itself up on import
+- `provisioning/dashboards/forgequeue.yml` — file provider that loads every dashboard JSON in `dashboards/`
+
+The dashboard assumes the `forgequeue` Prometheus datasource UID matches what the provisioning file registers.
+
 ## Running the whole stack
 
 ```bash

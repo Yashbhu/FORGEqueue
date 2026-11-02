@@ -17,6 +17,15 @@ spec:
         app.kubernetes.io/part-of: forgequeue
     spec:
       terminationGracePeriodSeconds: 30
+      # Spread replicas across nodes so one node loss cannot take out every
+      # copy. ScheduleAnyway keeps scheduling working on single-node kind.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -32,6 +41,15 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
         - name: wait-for-postgres
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z postgres 5432; do echo waiting for postgres; sleep 1; done"]
@@ -42,6 +60,15 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
       containers:
         - name: gateway
           image: forgequeue/gateway:latest
@@ -59,10 +86,10 @@ spec:
                 secretKeyRef:
                   name: forgequeue-secrets
                   key: POSTGRES_PASSWORD
-            # The journal DSN is derived from the shared Postgres password so
-            # the credential lives in exactly one place.
+            # Derive the journal DSN from the shared Postgres password so the
+            # credential lives in exactly one place.
             - name: FORGEQUEUE_PG_DSN
-              value: "postgres://forgequeue:$(POSTGRES_PASSWORD)@postgres:5432/forgequeue?sslmode=disable"
+              value: "postgres://forgequeue:$(POSTGRES_PASSWORD)@postgres:5432/forgequeue?sslmode=$(FORGEQUEUE_PG_SSLMODE)"
           ports:
             - name: grpc
               containerPort: 50051
@@ -92,6 +119,8 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
 ---
 apiVersion: v1
 kind: Service

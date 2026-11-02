@@ -5,6 +5,5 @@ import (
 )
 
 func main() {
-	// Call the execution function inside your internal package
 	gateway.Start()
 }

@@ -12,3 +12,7 @@ namespace: forgequeue
 
 resources:
   - servicemonitor.yaml
+  - prometheusrule.yaml
+  # Requires the KEDA CRDs. Do not include this alongside the CPU HPA for the
+  # worker (both target the same Deployment); see the file's header.
+  # - keda-scaledobject.yaml

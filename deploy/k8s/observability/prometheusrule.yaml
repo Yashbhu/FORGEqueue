@@ -1,0 +1,80 @@
+# Alerting rules for the queue internals and the platform around it. Requires
+# kube-prometheus-stack's PrometheusRule CRD (monitoring.coreos.com/v1), the
+# same dependency the ServiceMonitor has.
+#
+# OTel translates dotted instrument names to underscores in Prometheus, so
+# forgequeue.queue.dead becomes forgequeue_queue_dead.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: forgequeue
+  labels:
+    app.kubernetes.io/part-of: forgequeue
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: forgequeue.queue
+      rules:
+        - alert: ForgeQueueBacklogGrowing
+          # A readily-visible backlog that is not draining. Tune to your
+          # expected steady-state depth.
+          expr: forgequeue_queue_ready > 1000
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Queue ready backlog above 1000 for 15m"
+            description: "{{ $value }} tasks are ready and the queue is not draining; scale workers or investigate a slow handler."
+
+        - alert: ForgeQueueDeadLettering
+          expr: increase(forgequeue_tasks_dead_lettered_total[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Tasks are being dead-lettered"
+            description: "{{ $value }} tasks moved to the DLQ in the last 10m; check handler errors and the DLQ in the console."
+
+        - alert: ForgeQueueLeaseLosses
+          # Lease loss means a worker could not renew ownership and the handler
+          # context was cancelled — often Redis latency or a crash.
+          expr: increase(forgequeue_lease_losses_total[5m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated lease losses"
+            description: "{{ $value }} lease losses in 5m; check Redis latency/availability and worker restarts."
+
+    - name: forgequeue.platform
+      rules:
+        - alert: ForgeQueueTargetDown
+          expr: up{job="forgequeue"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "ForgeQueue metrics target down"
+            description: "{{ $labels.instance }} has been unscrapeable for 5m."
+
+        - alert: PostgresBackupFailed
+          expr: kube_job_status_failed{job_name=~"postgres-backup.*"} > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Postgres backup job failed"
+            description: "A postgres-backup CronJob failed; the durable journal has no recent logical backup."
+
+        - alert: PersistentVolumeFillingUp
+          expr: >
+            kubelet_volume_stats_used_bytes{persistentvolumeclaim=~"redis-data-.*|data-postgres-0"}
+            /
+            kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"redis-data-.*|data-postgres-0"}
+            > 0.85
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Volume {{ $labels.persistentvolumeclaim }} is over 85% full"
+            description: "Grow the PVC or add retention; a full Redis/Postgres volume stops accepting writes."

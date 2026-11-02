@@ -8,6 +8,11 @@ metadata:
 spec:
   serviceName: postgres
   replicas: 1
+  # Retain the data volume on delete and on scale-down. This is the only
+  # durable copy, so we don't want a StatefulSet change dropping it.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres
@@ -22,9 +27,10 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
+      automountServiceAccountToken: false
       containers:
         - name: postgres
-          image: postgres:16
+          image: postgres:16.15
           env:
             - name: POSTGRES_DB
               value: forgequeue
@@ -35,33 +41,57 @@ spec:
                 secretKeyRef:
                   name: forgequeue-secrets
                   key: POSTGRES_PASSWORD
-            # Keep the cluster data in a subdir so the volume root can hold the
-            # lost+found directory some CSI drivers create.
+            # Data goes in a subdir so the volume root can hold lost+found,
+            # which some CSI drivers create.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           ports:
             - name: postgres
               containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          # Generous startupProbe for first-boot initdb and crash recovery.
+          # Liveness only starts after the DB accepts connections, so a slow
+          # disk can't restart-loop us into a half-initialized PGDATA.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "forgequeue", "-d", "forgequeue"]
+            periodSeconds: 10
+            failureThreshold: 30
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "forgequeue", "-d", "forgequeue"]
-            initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "forgequeue", "-d", "forgequeue"]
-            initialDelaySeconds: 15
             periodSeconds: 20
           resources:
+            # requests == limits gives Postgres Guaranteed QoS, so node memory
+            # pressure evicts best-effort pods instead of the journal.
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 500m
+              memory: 512Mi
             limits:
               cpu: 500m
               memory: 512Mi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

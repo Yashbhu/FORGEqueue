@@ -7,8 +7,19 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Terminate TLS at the edge and force HTTPS. cert-manager issues the
+    # certificate into the secret referenced under spec.tls below.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: nginx
+  # TLS terminates here, so credentials and bearer tokens never cross the
+  # public network in clear text. Everything behind the ingress is the
+  # in-cluster pod network.
+  tls:
+    - hosts:
+        - forgequeue.local
+      secretName: forgequeue-tls
   rules:
     - host: forgequeue.local
       http:

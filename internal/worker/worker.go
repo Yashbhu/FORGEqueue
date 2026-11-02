@@ -16,6 +16,8 @@ import (
 	"forgequeue/internal/durable"
 	"forgequeue/internal/metrics"
 	"forgequeue/internal/model"
+	"forgequeue/internal/redisutil"
+	"forgequeue/internal/version"
 )
 
 // worker registry keys. a pool publishes its identity on Start and keeps it
@@ -138,28 +140,21 @@ type TaskClaim struct {
 }
 
 func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr: addr,
-
-		// enough connections for the workers and their concurrent Redis ops.
-		PoolSize: concurrencyLimit * 2,
-	})
-
-	// one context for the whole pool, passed to every Redis operation so
-	// Stop() can interrupt them.
+	// One context for the whole pool, passed to every Redis operation so
+	// Stop() can interrupt them. It also bounds the connection check below.
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// enough connections for the workers and their concurrent Redis ops.
+	// redisutil applies auth/TLS from the environment in one place.
+	client, err := redisutil.NewClient(addr, concurrencyLimit*2, ctx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	// separate context for the background loops, so a graceful drain can stop
 	// them without cancelling handlers still finishing under ctx.
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-
-	// make sure Redis is reachable before returning the pool.
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		// pool won't start, so drop the contexts we just made.
-		cancel()
-		bgCancel()
-		return nil, err
-	}
 
 	hostname, _ := os.Hostname()
 
@@ -170,7 +165,7 @@ func NewWorkerPool(addr string, concurrencyLimit int) (*WorkerPool, error) {
 		id:               uuid.New().String(),
 		hostname:         hostname,
 		startedAt:        time.Now(),
-		version:          "v0.9.1",
+		version:          version.Version,
 
 		wg: sync.WaitGroup{},
 

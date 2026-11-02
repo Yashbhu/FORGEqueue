@@ -4,14 +4,6 @@ ForgeQueue is a Redis-backed task queue written in Go. It implements durable,
 at-least-once task execution with leases, heartbeats, crash recovery, and
 ownership fencing from first principles.
 
-> **What this is.** A learning / portfolio project that implements a task queue
-> the way a real one works: atomic Lua state transitions, lease ownership,
-> heartbeats, recovery, retries and a dead-letter queue. It is deliberately
-> small and readable rather than production-hardened. It is **not** a drop-in
-> replacement for Redis-backed job systems like Asynq, Celery, BullMQ or
-> Sidekiq — see [Limitations](#limitations) for the honest list of what it does
-> not do.
-
 Key features:
 - At-least-once execution with lease-based ownership and fencing
 - Automatic retries with exponential backoff
@@ -136,6 +128,27 @@ be the accurate signal. Metrics are scraped via the `ServiceMonitor` in
 `deploy/k8s/observability`, which is applied separately **after** installing
 kube-prometheus-stack (the `monitoring.coreos.com` CRDs must exist). The Ingress
 targets the `forgequeue.local` host and needs an ingress-nginx controller.
+
+Launch hardening baked into the manifests:
+
+- **TLS at the edge.** The Ingress terminates TLS (cert-manager
+  `letsencrypt-prod` by default) and redirects HTTP to HTTPS; the console and
+  `/api` share one origin, so the API needs no CORS grant in production.
+- **Redis AUTH.** The Redis StatefulSet runs with `requirepass` sourced from
+  `forgequeue-secrets` (`FORGEQUEUE_REDIS_PASSWORD`); every service reads it
+  through `redisutil`. `maxmemory-policy noeviction` bounds memory without
+  silently dropping queued tasks.
+- **Alerting.** `observability/prometheusrule.yaml` ships alerts for backlog
+  growth, dead-lettering, lease losses, a down scrape target, failed backups
+  and filling persistent volumes.
+- **Queue-depth autoscaling.** `observability/keda-scaledobject.yaml` scales
+  workers on the ready-list length (KEDA); it supersedes the CPU HPA.
+- **Off-cluster backups.** `base/backup.yaml` adds a daily `pg_dump` to object
+  storage in addition to the on-PVC copy, and no-ops when unconfigured.
+
+Images are built and signed (SBOM + provenance + cosign) by
+`.github/workflows/release.yml` on a `v*` tag. Pin the printed digests in
+`overlays/prod` before deploying.
 
 ## Architecture
 
@@ -279,6 +292,16 @@ The batch's heartbeats are only stopped **after** the ACK/requeue is committed. 
 | Setting | Location | Default |
 | --- | --- | --- |
 | Redis address | `FORGEQUEUE_REDIS_ADDR` | `localhost:6379` |
+| Redis password (AUTH) | `FORGEQUEUE_REDIS_PASSWORD` | none |
+| Redis database index | `FORGEQUEUE_REDIS_DB` | `0` |
+| Redis TLS | `FORGEQUEUE_REDIS_TLS` | off |
+| Redis TLS verify skip (dev) | `FORGEQUEUE_REDIS_TLS_INSECURE` | off |
+| Redis TLS CA bundle | `FORGEQUEUE_REDIS_TLS_CA` | system roots |
+| gRPC TLS cert / key | `FORGEQUEUE_GRPC_TLS_CERT` / `_KEY` | off (plaintext) |
+| gRPC TLS client CA (mTLS) | `FORGEQUEUE_GRPC_TLS_CLIENT_CA` | off |
+| API CORS origins (comma list) | `FORGEQUEUE_CORS_ORIGINS` | same-origin only |
+| API max request body | `FORGEQUEUE_MAX_BODY_BYTES` | 1 MiB |
+| Postgres sslmode (DSN) | `FORGEQUEUE_PG_SSLMODE` | `disable` |
 | Gateway gRPC listen | `gateway.Start()` (hardcoded) | `:50051` |
 | Gateway metrics address | `FORGEQUEUE_METRICS_ADDR` | disabled |
 | HTTP API listen | `FORGEQUEUE_API_ADDR` | `:8080` |
@@ -309,6 +332,52 @@ The batch's heartbeats are only stopped **after** the ACK/requeue is committed. 
 | Promotion interval | `promotionLoop` | 1s |
 | Backoff base | `wp.backoffBase` (unexported) | 1s |
 | Backoff cap | `wp.backoffCap` (unexported) | 60s |
+
+## Observability
+
+The gateway and worker each expose Prometheus metrics at `/metrics` on
+`FORGEQUEUE_METRICS_ADDR` (disabled by default). They are scraped as two
+separate jobs so "accepted" (gateway) and "executed" (worker) stay
+distinguishable:
+
+- `forgequeue_tasks_enqueued_total` — tasks the gateway accepted
+- `forgequeue_tasks_processed_total` — tasks the worker ACKed
+- `forgequeue_tasks_retried_total` / `forgequeue_tasks_dead_lettered_total`
+- `forgequeue_queue_ready / inflight / scheduled / dead` — queue depth by state, sampled from Redis every 5s (O(1) per scrape)
+- `forgequeue_task_duration_seconds` — handler duration histogram (p50/p95/p99)
+- `forgequeue_redis_claim/ack/heartbeat_seconds` — Redis round-trip histograms
+- `forgequeue_lease_losses_total` — fenced lease losses
+
+Run the whole telemetry stack locally with `deploy/observability.sh` (needs
+`prometheus` on PATH; Grafana is optional and only started if installed):
+
+```bash
+./deploy/observability.sh
+# in another terminal, generate some load:
+go run ./cmd/demoenqueue
+```
+
+That prints the URLs: gateway `:9090/metrics`, worker `:9091/metrics`,
+Prometheus UI on `:9095`, and Grafana on `:3000` (no login) when available.
+Logs go to `/tmp/fq-*.log`.
+
+### Kubernetes
+
+Under `deploy/k8s/observability` (applied separately after kube-prometheus-stack, since its CRDs must exist):
+
+- `servicemonitor.yaml` — scrapes the `worker` and `gateway` `metrics` ports every 15s
+- `prometheusrule.yaml` — alerts for backlog growth, dead-lettering, lease losses, a down scrape target, failed backups and filling persistent volumes
+- `keda-scaledobject.yaml` — scales workers on ready-list length; supersedes the CPU HPA in `base/`
+
+### Grafana
+
+Dashboards live under `deploy/grafana`:
+
+- `dashboards/forgequeue.json` — "ForgeQueue Overview": enqueued/processed/retried/dead-lettered stats, queue depth by state, in-flight vs ready, handler duration p50/p95/p99, Redis round trips p95, lease losses, and enqueued vs processed throughput
+- `provisioning/datasources/prometheus.yml` — provisions the Prometheus datasource (`uid: forgequeue`, `http://localhost:9095`) so the dashboard wires itself up on import
+- `provisioning/dashboards/forgequeue.yml` — file provider that loads every dashboard JSON in `dashboards/`
+
+The dashboard assumes the `forgequeue` Prometheus datasource UID matches what the provisioning file registers.
 
 ## Running the whole stack
 
@@ -426,7 +495,13 @@ Real handlers dominate throughput in practice, so treat these as an upper bound.
 
 - **No exactly-once.** Delivery is at-least-once: a lease can expire (worker crash, Redis blip, GC pause) and a task can run twice. Handlers must be idempotent.
 - **Single Redis.** No replication, sharding, or failover logic — durability is whatever the Redis deployment provides. The bundled Kubernetes manifest runs one AOF-backed Redis on a PersistentVolumeClaim, but that is still a single point of failure.
-- **Partial auth.** The HTTP API has JWT + RBAC, with optional OIDC/SSO login. The **gRPC gateway and Redis have no authentication or TLS**, and the HTTP API itself is plain HTTP. Do not expose any of it to a public network.
+- **Partial auth.** The HTTP API and the gRPC gateway authenticate with JWT
+  bearer tokens (RBAC on the API, per-method permissions on gRPC), with
+  optional OIDC/SSO login. Transport TLS is available but **off by default**:
+  enable it on gRPC with the `FORGEQUEUE_GRPC_TLS_*` vars and terminate HTTP
+  TLS at the ingress (see the Kubernetes section). Redis supports
+  `requirepass` and TLS through its env vars. On a trusted pod network the
+  defaults are plaintext; do not expose any port publicly without enabling TLS.
 - **No multi-tenancy / queue isolation.** "Queues" are a single logical namespace, not separate Redis keyspaces or broker connections.
 - **Completed bodies are deleted**, so a finished job cannot be looked up by ID afterwards (see the HTTP API note above).
 - **Idle polling** uses a short sleep interval per worker; blocking variants (e.g. `BLMOVE`) are not implemented.

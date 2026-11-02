@@ -16,6 +16,8 @@ secretGenerator:
       - FORGEQUEUE_AUTH_SECRET=devsecret-change-me
       - FORGEQUEUE_ADMIN_USER=admin
       - FORGEQUEUE_ADMIN_PASSWORD=devpassword
+      # AUTH for the Redis StatefulSet and every service that connects to it.
+      - FORGEQUEUE_REDIS_PASSWORD=devredis
       # Shared by the Postgres StatefulSet (POSTGRES_PASSWORD) and the derived
       # FORGEQUEUE_PG_DSN that gateway/worker build in the base manifests.
       - POSTGRES_PASSWORD=devpostgres

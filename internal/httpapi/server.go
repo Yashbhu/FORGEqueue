@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -17,6 +18,10 @@ type Server struct {
 	auth *auth.Service
 	oidc *auth.OIDC
 	h    *Handler
+
+	// Login brute-force guards: one global backstop and one per client IP.
+	loginGlobal *rateLimiter
+	loginIP     *rateLimiter
 }
 
 func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
@@ -24,7 +29,13 @@ func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
 		addr = ":8080"
 	}
 
-	s := &Server{auth: authSvc}
+	s := &Server{
+		auth: authSvc,
+		// Burst generous enough to absorb a human retyping a password; the
+		// sustained rate is what stops automated guessing.
+		loginGlobal: newRateLimiter(20, 40),
+		loginIP:     newRateLimiter(0.2, 10),
+	}
 	h := NewHandler(rdb, authSvc)
 	mux := http.NewServeMux()
 
@@ -41,7 +52,7 @@ func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
-	mux.HandleFunc("POST /api/auth/login", h.Login)
+	mux.HandleFunc("POST /api/auth/login", s.loginLimiter(h.Login))
 	mux.HandleFunc("GET /api/auth/config", h.AuthConfig)
 	mux.HandleFunc("GET /api/auth/oidc/login", h.OIDCLogin)
 	mux.HandleFunc("GET /api/auth/oidc/callback", h.OIDCCallback)
@@ -100,13 +111,30 @@ func NewServer(addr string, rdb *redis.Client, authSvc *auth.Service) *Server {
 	mux.HandleFunc("GET /api/metrics/throughput", s.require(auth.PermMetricsRead, h.Throughput))
 
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           corsMiddleware(mux),
+		Addr: addr,
+		// Outer-most middleware first: headers on every response, then CORS,
+		// then a body cap, then the router.
+		Handler:           securityHeaders(corsMiddleware(parseOrigins(os.Getenv("FORGEQUEUE_CORS_ORIGINS")))(limitBody(envInt64(os.Getenv("FORGEQUEUE_MAX_BODY_BYTES"), 1<<20))(mux))),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	s.srv = srv
 	s.h = h
 	return s
+}
+
+// loginLimiter rejects credential attempts over budget, per IP and globally.
+func (s *Server) loginLimiter(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.loginGlobal.allow("global") || !s.loginIP.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, "too many login attempts, try again later")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // SetOIDC enables single sign-on on the server. Call before Start.
@@ -153,19 +181,6 @@ func (s *Server) authenticate(r *http.Request) (auth.Identity, bool) {
 		return auth.Identity{}, false
 	}
 	return id, true
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (s *Server) Start() error {

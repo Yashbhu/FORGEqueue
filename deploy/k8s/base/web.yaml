@@ -17,6 +17,15 @@ spec:
         app.kubernetes.io/part-of: forgequeue
     spec:
       terminationGracePeriodSeconds: 15
+      # Spread replicas across nodes so one node loss cannot take out every
+      # copy. ScheduleAnyway keeps scheduling working on single-node kind.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: web
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -52,6 +61,8 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: tmp
               mountPath: /tmp

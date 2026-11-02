@@ -8,6 +8,11 @@ metadata:
 spec:
   serviceName: redis
   replicas: 1
+  # Keep the AOF volume on delete and scale-down: it is the only copy of the
+  # queue until the Postgres journal reconstitutes it.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app.kubernetes.io/name: redis
@@ -22,20 +27,40 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
       containers:
         - name: redis
           image: redis:7.4-alpine
+          # REDISCLI_AUTH lets the readiness/liveness probes (and any in-pod
+          # redis-cli) authenticate without putting the password on the command
+          # line, where it would leak via `ps`.
+          env:
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: forgequeue-secrets
+                  key: FORGEQUEUE_REDIS_PASSWORD
           # AOF is the durability mechanism: appendonly + everysec fsync, plus
           # an RDB snapshot every 60s as a fast restart path. The appendonly
           # data lives on a PVC so it outlives the pod.
-          args:
-            - "--appendonly"
-            - "yes"
-            - "--appendfsync"
-            - "everysec"
-            - "--save"
-            - "60"
-            - "1000"
+          #
+          # requirepass closes the gap the NetworkPolicy cannot: any pod that
+          # reaches the port must still authenticate. maxmemory-policy is
+          # noeviction on purpose — evicting a queued task silently loses work,
+          # so instead we bound memory and let the alert fire on noeviction.
+          command:
+            - sh
+            - -c
+            - >
+              exec redis-server
+              --appendonly yes
+              --appendfsync everysec
+              --save 60 1000
+              --requirepass "$FORGEQUEUE_REDIS_PASSWORD"
+              --maxmemory 192mb
+              --maxmemory-policy noeviction
           ports:
             - name: redis
               containerPort: 6379
@@ -50,15 +75,30 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
+            # requests == limits keeps Redis out of the eviction path; the
+            # maxmemory above is deliberately below the 256Mi limit so Redis
+            # hits its own ceiling before the kernel OOM-kills the pod.
             requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 250m
+              cpu: 100m
               memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -69,7 +109,7 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 1Gi
+            storage: 2Gi
 ---
 apiVersion: v1
 kind: Service
@@ -80,7 +120,8 @@ metadata:
     app.kubernetes.io/part-of: forgequeue
 spec:
   selector:
-    app.kubernetes.io/name: redis
+    matchLabels:
+      app.kubernetes.io/name: redis
   ports:
     - name: redis
       port: 6379

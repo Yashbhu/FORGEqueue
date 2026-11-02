@@ -258,7 +258,7 @@ function Sidebar({ collapsed }: { collapsed: boolean }) {
       >
         {!collapsed && (
           <div className="font-mono text-[11px] text-muted-foreground">
-            {import.meta.env["VITE_APP_VERSION"] || "v0.9.1"}
+            {import.meta.env["VITE_APP_VERSION"] || "dev"}
           </div>
         )}
         <ConnectionDot withText={!collapsed} />
